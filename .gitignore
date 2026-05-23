@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Model weights — too large for git
+*.pt
+*.pth
+*.safetensors
+*.bin
+
+# Data — stays on T7
+prism_data/
+*.tgz
+*.zip
+
+# HuggingFace cache
+hf_cache/
+
+# Outputs — videos and frames
+experiments/
+visualizations/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+._*

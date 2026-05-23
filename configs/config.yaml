@@ -1,0 +1,88 @@
+# PRISM Configuration
+# Predictive Reasoning and Intuition System for Mobility
+
+project:
+  name: PRISM
+  version: "0.1.0"
+  description: "Camera-only autonomous mobility stack with VLM reasoning"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  root: "~/prism_data"                      # symlink to T7 drive
+  nuscenes_root: "~/prism_data/datasets/nuscenes"
+  nuscenes_version: "v1.0-mini"
+  output_dir: "~/prism_data/experiments"
+
+# ── Sensory Core ──────────────────────────────────────────────────────────────
+sensory_core:
+  detection:
+    model: "yolov8n.pt"                     # nano — fast, Jetson friendly
+    confidence_threshold: 0.35
+    iou_threshold: 0.45
+    device: "mps"                           # Metal on M4 | "cuda" on Jetson | "cpu" fallback
+    img_size: 640
+    classes_of_interest:                    # COCO classes relevant to driving
+      - 0   # person
+      - 1   # bicycle
+      - 2   # car
+      - 3   # motorcycle
+      - 5   # bus
+      - 7   # truck
+      - 9   # traffic light
+      - 11  # stop sign
+
+  depth:
+    model: "depth-anything-v2-small"        # small — edge deployable
+    device: "mps"
+    run_every_n_frames: 3                   # run at ~10fps when camera is 30fps
+    encoder: "vits"                         # vits | vitb | vitl
+
+  segmentation:
+    model: "fastsam-s.pt"                   # FastSAM small
+    device: "mps"
+    run_every_n_frames: 3
+    confidence_threshold: 0.4
+
+  optical_flow:
+    method: "farneback"                     # cpu-friendly dense optical flow
+    run_every_n_frames: 1                   # every frame — lightweight
+
+  sampling:
+    camera_fps: 12                          # nuScenes is 12fps
+    detection_fps: 12
+    depth_fps: 4
+    segmentation_fps: 4
+    flow_fps: 12
+
+# ── World Model ───────────────────────────────────────────────────────────────
+world_model:
+  bev:
+    x_range: [-50, 50]                      # meters ahead/behind ego
+    y_range: [-50, 50]                      # meters left/right of ego
+    z_range: [-3, 5]                        # meters up/down
+    resolution: 0.5                         # meters per cell
+    grid_size: [200, 200]                   # derived from range/resolution
+
+  actor_tracker:
+    max_age: 10                             # frames before track is dropped
+    min_hits: 2                             # frames before track is confirmed
+    iou_threshold: 0.3
+
+# ── Cameras (nuScenes) ────────────────────────────────────────────────────────
+cameras:
+  names:
+    - "CAM_FRONT"
+    - "CAM_FRONT_LEFT"
+    - "CAM_FRONT_RIGHT"
+    - "CAM_BACK"
+    - "CAM_BACK_LEFT"
+    - "CAM_BACK_RIGHT"
+  primary: "CAM_FRONT"                      # used for single-cam mode
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  use_wandb: false                          # enable when ready for experiments
+  wandb_project: "prism-autonomy"
+  save_visualizations: true
+  viz_output_dir: "~/prism_data/experiments/visualizations"
