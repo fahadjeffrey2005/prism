@@ -65,15 +65,17 @@ class LoRALayer(torch.nn.Module):
         in_features = original_layer.weight.shape[1]
         out_features = original_layer.weight.shape[0]
 
-        self.lora_A = torch.nn.Linear(in_features, rank, bias=False)
-        self.lora_B = torch.nn.Linear(rank, out_features, bias=False)
+        device = original_layer.weight.device
+        dtype = original_layer.weight.dtype
 
-        # Initialize: A=random, B=zero (so initial delta=0)
+        self.lora_A = torch.nn.Linear(in_features, rank, bias=False).to(device=device, dtype=dtype)
+        self.lora_B = torch.nn.Linear(rank, out_features, bias=False).to(device=device, dtype=dtype)
+
         torch.nn.init.kaiming_uniform_(self.lora_A.weight)
         torch.nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
-        return self.original(x) + self.lora_B(self.lora_A(x)) * self.scale
+        return self.original(x) + self.lora_B(self.lora_A(x.to(self.lora_A.weight.dtype))) * self.scale
 
 
 def apply_lora(model, rank=16, alpha=32, target_modules=None):
@@ -341,20 +343,19 @@ def train(args):
         model_id,
         torch_dtype=torch.bfloat16,
         ignore_mismatched_sizes=True,
-    ).cuda()
+    )
+    model = model.cuda()
+    logger.info(f"Model loaded on: {next(model.parameters()).device}")
 
-    # Load from checkpoint if continuing
+    # Apply LoRA AFTER moving to CUDA so layers inherit correct device
+    model, lora_layers = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+
     if args.checkpoint:
         logger.info(f"Loading LoRA checkpoint: {args.checkpoint}")
         lora_state = torch.load(args.checkpoint)
-        # Apply LoRA first then load weights
-        model, lora_layers = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
-        # Load saved LoRA weights
         for name, layer in lora_layers.items():
             if name in lora_state:
                 layer.load_state_dict(lora_state[name])
-    else:
-        model, lora_layers = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
 
     # Only optimize LoRA parameters
     optimizer = torch.optim.AdamW(
