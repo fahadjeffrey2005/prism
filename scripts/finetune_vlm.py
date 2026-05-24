@@ -269,41 +269,53 @@ def collate_fn(batch, processor):
     """Custom collate for VLM training."""
     from qwen_vl_utils import process_vision_info
 
-    texts = []
-    all_image_inputs = []
+    all_inputs = []
 
     for item in batch:
         messages = item["messages"]
-        # Only user turn for input
-        user_msgs = [m for m in messages if m["role"] == "user"]
+        # Full conversation including assistant response
         text = processor.apply_chat_template(
-            user_msgs, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=False
         )
-        texts.append(text)
-        image_inputs, _ = process_vision_info(user_msgs)
-        all_image_inputs.extend(image_inputs)
+        # Process each sample individually to avoid token mismatch
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        image_inputs, video_inputs = process_vision_info(user_msgs)
 
-    inputs = processor(
-        text=texts,
-        images=all_image_inputs if all_image_inputs else None,
-        padding=True,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
+        inp = processor(
+            text=[text],
+            images=image_inputs if image_inputs else None,
+            videos=video_inputs if video_inputs else None,
+            padding=True,
+            return_tensors="pt",
+            truncation=True,
+            max_length=768,
+        )
+        all_inputs.append(inp)
+
+    # Batch together
+    from torch.nn.utils.rnn import pad_sequence
+    import torch
+
+    input_ids = pad_sequence(
+        [x["input_ids"][0] for x in all_inputs],
+        batch_first=True, padding_value=processor.tokenizer.pad_token_id or 0
+    )
+    attention_mask = pad_sequence(
+        [x["attention_mask"][0] for x in all_inputs],
+        batch_first=True, padding_value=0
     )
 
-    # Labels — answer tokens
-    answers = [item["answer"] for item in batch]
-    labels = processor.tokenizer(
-        answers,
-        padding=True,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-    )
+    result = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-    inputs["labels"] = labels["input_ids"]
-    return inputs
+    # Handle pixel values
+    if "pixel_values" in all_inputs[0]:
+        result["pixel_values"] = torch.cat([x["pixel_values"] for x in all_inputs], dim=0)
+    if "image_grid_thw" in all_inputs[0]:
+        result["image_grid_thw"] = torch.cat([x["image_grid_thw"] for x in all_inputs], dim=0)
+
+    # Labels = input_ids shifted (causal LM)
+    result["labels"] = input_ids.clone()
+    return result
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
