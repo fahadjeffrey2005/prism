@@ -36,7 +36,7 @@ import torch
 import numpy as np
 import cv2
 from torch.utils.data import Dataset, DataLoader
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from prism.utils.common import load_config, get_logger
 from prism.sensory_core.data_loader import NuScenesLoader
 
@@ -337,7 +337,7 @@ def train(args):
     model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
     logger.info(f"Loading {model_id}...")
     processor = AutoProcessor.from_pretrained(model_id)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
         ignore_mismatched_sizes=True,
