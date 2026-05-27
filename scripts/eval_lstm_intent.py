@@ -137,6 +137,11 @@ def run_scene(
         t        = sample["timestamp"] / 1e6
         anns     = sample["anns"]
 
+        # ── Ego pose for this sample (used for ego-relative distance) ──────
+        sd_front  = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
+        ego_pose  = nusc.get("ego_pose", sd_front["ego_pose_token"])
+        ego_xy    = np.array(ego_pose["translation"][:2], dtype=np.float32)
+
         # Filter to dynamic actors
         actors = []
         for ann_token in anns:
@@ -178,11 +183,11 @@ def run_scene(
             else:
                 cls = "car"
 
-            # Ego-relative distance (approximate using global position for now)
-            # In full pipeline this comes from metric_depth; here use GT directly
-            dist_m = np.linalg.norm(pos_xy)   # rough — GT global pos from origin
+            # Ego-relative distance — annotation global pos minus ego global pos
+            rel_xy = pos_xy - ego_xy
+            dist_m = float(np.linalg.norm(rel_xy))
 
-            # Speed from position delta
+            # Speed from position delta (global frame deltas = real motion)
             prev_pos = last_positions.get(itoken)
             if prev_pos is not None:
                 dp    = pos_xy - prev_pos
