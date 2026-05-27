@@ -42,6 +42,7 @@ from prism.predictive_engine.engine import PredictiveEngine, MANEUVERS
 from prism.predictive_engine.decision import SmartDecisionEngine, DECISIONS, PED_STATES
 from prism.semantic_reasoner.reasoner import SemanticReasoner
 from prism.arbitration.core import ArbitrationCore
+from prism.planner.planner import AdaptivePlanner
 
 logger = get_logger("run_predictive")
 
@@ -896,6 +897,7 @@ def main():
 
     decision_engine = SmartDecisionEngine()
     arbitrator      = ArbitrationCore(cfg)
+    planner         = AdaptivePlanner(cfg)
     reasoner        = SemanticReasoner(cfg)
     logger.info(f"VLM available: {reasoner.vlm.available}")
 
@@ -975,12 +977,22 @@ def main():
         )
         logger.debug(arb_decision.short_reason)
 
+        # Layer 6 — Adaptive Planner (jerk-limited velocity profile + control)
+        plan = planner.plan(arb_decision, metric_dets=metric_dets,
+                            timestamp=world_state.timestamp)
+
         elapsed = (time.time() - t0) * 1000
         stats["frames"] += 1
         stats["times"].append(elapsed)
 
         action = arb_decision.action
         stats["actions"][action] = stats["actions"].get(action, 0) + 1
+        if plan.emergency:
+            stats.setdefault("emergency_frames", 0)
+            stats["emergency_frames"] += 1
+        if plan.spatial_override:
+            stats.setdefault("spatial_overrides", 0)
+            stats["spatial_overrides"] += 1
 
         for md in metric_dets:
             stats["threat_zones"][md.threat_zone] += 1
@@ -996,14 +1008,14 @@ def main():
                 if gt_dist:
                     validator.add_sample(md.distance_m, gt_dist)
 
-        # Log — show Arbitration Core decision with dominant signal + SmartDecision context
+        # Log — Arbitration Core + Planner output
+        _emrg_tag = " ⚡EMRG" if plan.emergency else (" 🔀SPA" if plan.spatial_override else "")
         logger.info(
             f"Frame {stats['frames']:3d} | {elapsed:.0f}ms | "
-            f"[ARB] {arb_decision.action:<9} {int(arb_decision.speed_factor*100)}% "
-            f"conf={arb_decision.confidence*100:.0f}% dom={arb_decision.dominant_signal} | "
-            f"peds:{scene.ped_count} veh:{scene.vehicle_count} | "
-            f"closest:{scene.closest_threat_m:.1f}m | "
-            f"{scene.primary_reason[:40]}"
+            f"[ARB] {arb_decision.action:<9} conf={arb_decision.confidence*100:.0f}% | "
+            f"[PLN] v={plan.current_speed_mps:.1f}→{plan.target_speed_mps:.1f}m/s "
+            f"thr={plan.control.throttle:.2f} brk={plan.control.brake:.2f}{_emrg_tag} | "
+            f"closest:{scene.closest_threat_m:.1f}m peds:{scene.ped_count} veh:{scene.vehicle_count}"
         )
 
         # Visualise
@@ -1070,6 +1082,12 @@ def main():
     logger.info(f"\nThreat zones:")
     for zone, count in stats["threat_zones"].items():
         logger.info(f"  {zone:<10} {count:3d}")
+
+    pln_stats = planner.stats
+    logger.info(f"\nPlanner:")
+    logger.info(f"  Final speed   : {pln_stats['v_current']:.2f} m/s  ({pln_stats['v_current']*3.6:.1f} km/h)")
+    logger.info(f"  Emergency brk : {stats.get('emergency_frames', 0)} frames")
+    logger.info(f"  Spatial ovrd  : {stats.get('spatial_overrides', 0)} frames")
 
     if validator:
         validator.print_report()

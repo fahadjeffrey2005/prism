@@ -92,6 +92,17 @@ vlm:
 # ── LSTM Intent Predictor ─────────────────────────────────────────────────────
 lstm_intent_checkpoint: "~/prism_data/checkpoints/lstm_intent/model.pt"
 
+# ── Adaptive Planner ─────────────────────────────────────────────────────────
+planner:
+  cruise_speed_mps:     8.33   # 30 km/h — nuScenes urban default
+  max_accel_mps2:       2.0    # comfortable urban acceleration
+  max_decel_mps2:       4.0    # firm braking (0.4 g)
+  emergency_decel_mps2: 8.0   # panic brake (0.8 g)
+  max_jerk_mps3:        2.0    # ISO 2631 passenger comfort limit
+  plan_horizon_s:       3.0    # seconds of lookahead
+  plan_dt_s:            0.1    # 10 Hz planning rate
+  safety_margin_m:      3.0    # clearance ahead of nearest corridor obstacle
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
   level: "INFO"
