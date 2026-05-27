@@ -576,8 +576,8 @@ def parse_args():
     p.add_argument("--data-root",  default=NUSCENES_ROOT)
     p.add_argument("--version",    default="v1.0-mini")
     p.add_argument("--out",        default=DEFAULT_OUT)
-    p.add_argument("--epochs",     type=int,   default=300)
-    p.add_argument("--lr",         type=float, default=3e-3)
+    p.add_argument("--epochs",     type=int,   default=400)
+    p.add_argument("--lr",         type=float, default=1e-3)
     p.add_argument("--batch-size", type=int,   default=64)
     p.add_argument("--bdd-npz",    default=None,
                    help="Path to BDD100K pre-extracted trajectories .npz "
