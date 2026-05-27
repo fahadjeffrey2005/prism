@@ -393,12 +393,9 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — focal loss with class weights
-    # Focal loss (gamma=2) focuses training on misclassified examples,
-    # forcing the model to learn rare classes (turn_left, braking) instead
-    # of coasting on constant_velocity and stopping which are easy and frequent.
+    # Loss — class-weighted cross entropy
     class_w   = train_ds.class_weights().to(device)
-    criterion = FocalLoss(gamma=2.0, weight=class_w)
+    criterion = nn.CrossEntropyLoss(weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
