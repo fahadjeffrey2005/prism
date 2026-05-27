@@ -237,6 +237,8 @@ def load_lstm_model(checkpoint_path: str, device: str = "cuda") -> Optional[LSTM
     Load trained LSTM from checkpoint.
     Returns None (with warning) if checkpoint not found — engine falls back to Bayesian.
     """
+    if not checkpoint_path:
+        return None
     path = Path(checkpoint_path)
     if not path.exists():
         logger.warning(f"LSTM checkpoint not found: {checkpoint_path} — using Bayesian fallback")

@@ -586,18 +586,18 @@ def run_ablation_benchmark(
     for config_name, flags in configs_to_run:
         print(f"  Running: {config_name}…")
 
-        # Build modified config for this ablation
-        run_cfg = dict(cfg)
-        if not flags["use_lstm"]:
-            run_cfg["lstm_intent_checkpoint"] = ""   # empty = no LSTM
-
-        loader         = NuScenesLoader(run_cfg)
-        core           = SensoryCore(run_cfg)
-        metric_engine  = MetricDepthEngine(run_cfg)
-        world          = WorldModel(run_cfg)
-        predictor      = PredictiveEngine(run_cfg)
+        loader         = NuScenesLoader(cfg)
+        core           = SensoryCore(cfg)
+        metric_engine  = MetricDepthEngine(cfg)
+        world          = WorldModel(cfg)
+        predictor      = PredictiveEngine(cfg)
         decision_engine= SmartDecisionEngine()
-        arbitrator     = ArbitrationCore(run_cfg) if flags["use_arb"] else None
+        arbitrator     = ArbitrationCore(cfg) if flags["use_arb"] else None
+
+        # No-LSTM: disable after construction so engine initialises cleanly
+        if not flags["use_lstm"]:
+            predictor._lstm_model  = None
+            predictor._lstm_active = False
 
         decision_counts: Dict[str, int] = defaultdict(int)
         level_sum   = 0
