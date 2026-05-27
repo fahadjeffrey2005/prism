@@ -23,7 +23,7 @@ Label derivation (from 5-frame future window at 2Hz = 2.5s lookahead):
     reversing         — net backward displacement > 0.5m
     turn_left/right   — mean heading change > 7° per step (checked BEFORE stopping)
     lane_change_*     — lateral displacement > 0.8m with forward motion > 0.3m
-    stopping          — final speed < 0.15 m/s AND mean speed < 0.4 m/s
+    stopping          — final speed < 0.25 m/s AND mean speed < 0.7 m/s
     braking           — mean deceleration < -0.5 m/s² while still moving
     accelerating      — mean acceleration > +0.5 m/s²
     constant_velocity — none of the above
@@ -236,13 +236,14 @@ def derive_label(future_pos: np.ndarray) -> int:
             return MANEUVERS.index("lane_change_right")
 
     # 4. Stopping: final speed near zero AND not turning/lane-changing.
-    # Tight threshold: parked cars and actors decelerating to a full stop only.
-    # Slow walkers (0.15–1.0 m/s) fall through to constant_velocity or braking.
-    if final_speed < 0.15 and mean_speed < 0.4:
+    # 0.25/0.7 threshold: captures parked cars and actors decelerating to a near-stop.
+    # Reorder ensures turning actors never reach this check, so threshold can be
+    # generous without stealing turn samples (that was the old cascade bug).
+    if final_speed < 0.25 and mean_speed < 0.7:
         return MANEUVERS.index("stopping")
 
     # 5. Strong deceleration (still moving)
-    if mean_accel < -0.5 and final_speed > 0.15:
+    if mean_accel < -0.5 and final_speed > 0.25:
         return MANEUVERS.index("braking")
 
     # 6. Strong acceleration
