@@ -302,6 +302,39 @@ class TrajectoryDataset(Dataset):
         return weights / weights.sum() * NUM_CLASSES
 
 
+# ── Focal loss ────────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """
+    Focal loss for class imbalance.
+    FL(p) = -alpha * (1 - p)^gamma * log(p)
+
+    gamma=0 → standard cross-entropy
+    gamma=2 → strongly down-weights easy/frequent examples,
+              forcing the model to focus on rare hard classes
+              like turn_left (13 samples) and braking (8 samples).
+    """
+
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None):
+        super().__init__()
+        self.gamma  = gamma
+        self.weight = weight   # per-class weights (inverse frequency)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = torch.log_softmax(logits, dim=-1)           # (B, C)
+        probs     = log_probs.exp()                             # (B, C)
+        gathered_log  = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # (B,)
+        gathered_prob = probs.gather(1,     targets.unsqueeze(1)).squeeze(1)  # (B,)
+        focal_factor  = (1.0 - gathered_prob) ** self.gamma
+        loss          = -focal_factor * gathered_log            # (B,)
+
+        if self.weight is not None:
+            w    = self.weight[targets]
+            loss = loss * w
+
+        return loss.mean()
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
@@ -360,9 +393,12 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — class-weighted cross entropy
+    # Loss — focal loss with class weights
+    # Focal loss (gamma=2) focuses training on misclassified examples,
+    # forcing the model to learn rare classes (turn_left, braking) instead
+    # of coasting on constant_velocity and stopping which are easy and frequent.
     class_w   = train_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    criterion = FocalLoss(gamma=2.0, weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
