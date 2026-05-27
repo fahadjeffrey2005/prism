@@ -35,6 +35,17 @@ from prism.utils.common import get_logger
 
 logger = get_logger("PredictiveEngine")
 
+# LSTM intent model — imported lazily so engine works without it
+try:
+    from prism.predictive_engine.lstm_intent import (
+        LSTMIntentNet, LSTMIntentPredictor, load_lstm_model,
+        top_maneuver, format_intent_bar,
+    )
+    _LSTM_AVAILABLE = True
+except ImportError:
+    _LSTM_AVAILABLE = False
+    logger.warning("lstm_intent module not found — Bayesian-only mode")
+
 
 # ── Maneuver definitions ──────────────────────────────────────────────────────
 
@@ -480,16 +491,48 @@ class PredictiveEngine:
     Runs every frame — pure Python/numpy, no neural network.
     Latency: < 5ms regardless of scene complexity.
 
+    Intent classification hierarchy:
+        1. LSTM (if checkpoint loaded) — trained on nuScenes, 10-frame history
+        2. Bayesian fallback — hand-tuned kinematic likelihoods, always available
+
     The VLM updates this engine asynchronously via update_vlm_intents().
     The engine never waits for VLM — it always produces predictions.
     """
 
+    DEFAULT_CHECKPOINT = "/home/koushik-test/prism_data/checkpoints/lstm_intent/model.pt"
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.actor_predictors: dict = {}    # track_id → ActorPredictor
+        self.actor_predictors: dict  = {}   # track_id → ActorPredictor
         self._frame_idx = 0
         self._last_predictions: dict = {}   # track_id → ActorPrediction
-        self._vlm_intents: dict = {}        # track_id → intent_str from VLM
+        self._vlm_intents: dict      = {}   # track_id → intent_str from VLM
+
+        # ── LSTM intent model ──────────────────────────────────────────────
+        self._lstm_model    = None
+        self._lstm_device   = "cpu"
+        self._lstm_predictors: dict = {}    # track_id → LSTMIntentPredictor
+        self._lstm_active   = False
+
+        if _LSTM_AVAILABLE:
+            checkpoint = cfg.get("lstm_intent_checkpoint", self.DEFAULT_CHECKPOINT)
+            import torch
+            if torch.cuda.is_available():
+                self._lstm_device = "cuda"
+            elif torch.backends.mps.is_available():
+                self._lstm_device = "mps"
+
+            self._lstm_model = load_lstm_model(checkpoint, self._lstm_device)
+            if self._lstm_model is not None:
+                self._lstm_active = True
+                logger.info(
+                    f"LSTM intent model active on {self._lstm_device} — "
+                    f"Bayesian fallback disabled for actors with ≥10 frames"
+                )
+            else:
+                logger.info("LSTM checkpoint not found — using Bayesian intent classifier")
+        # ──────────────────────────────────────────────────────────────────
+
         logger.info("Predictive Engine ready")
 
     def update(self, world_state, metric_detections: list = None) -> PredictiveState:
@@ -538,23 +581,45 @@ class PredictiveEngine:
             # Get VLM intent if available
             vlm_intent = self._vlm_intents.get(actor.track_id)
 
-            # Run predictor
+            # ── LSTM intent override ───────────────────────────────────────
+            lstm_probs = None
+            if self._lstm_active and self._lstm_model is not None:
+                if actor.track_id not in self._lstm_predictors:
+                    self._lstm_predictors[actor.track_id] = LSTMIntentPredictor(
+                        self._lstm_model, self._lstm_device
+                    )
+                lstm_pred  = self._lstm_predictors[actor.track_id]
+                lstm_probs = lstm_pred.update(pos_m, world_state.timestamp)
+
+                if lstm_probs is not None:
+                    # Replace maneuver probs in the Bayesian predictor with LSTM output
+                    predictor.maneuver_probs = lstm_probs.copy()
+                    top = top_maneuver(lstm_probs, actor.class_name)
+                    top_p = float(lstm_probs.max())
+                    logger.debug(
+                        f"[LSTM] actor#{actor.track_id} ({actor.class_name}) "
+                        f"@ {distance_m:.1f}m → {top} ({top_p*100:.0f}%)"
+                    )
+            # ──────────────────────────────────────────────────────────────
+
+            # Run predictor (uses maneuver_probs — updated by LSTM above if active)
             pred = predictor.update(
                 pos_m=pos_m,
                 vel_px=actor.velocity_px,
                 timestamp=world_state.timestamp,
                 depth_m=distance_m,
-                vlm_intent=vlm_intent
+                vlm_intent=vlm_intent,
             )
             predictions.append(pred)
             self._last_predictions[actor.track_id] = pred
 
-        # Clean up stale predictors
+        # Clean up stale predictors (Bayesian + LSTM)
         active_ids = {a.track_id for a in world_state.actors}
         stale = [tid for tid in self.actor_predictors if tid not in active_ids]
         for tid in stale:
             del self.actor_predictors[tid]
             self._last_predictions.pop(tid, None)
+            self._lstm_predictors.pop(tid, None)
 
         # Scene-level assessment
         collision_actors = [
@@ -655,7 +720,8 @@ class PredictiveEngine:
         return "continue", 1.0
 
     def reset(self):
-        self.actor_predictors = {}
-        self._last_predictions = {}
-        self._vlm_intents = {}
-        self._frame_idx = 0
+        self.actor_predictors   = {}
+        self._last_predictions  = {}
+        self._vlm_intents       = {}
+        self._lstm_predictors   = {}
+        self._frame_idx         = 0

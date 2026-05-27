@@ -1,0 +1,471 @@
+"""
+PRISM — LSTM Intent Model Training
+====================================
+Extracts actor trajectories from nuScenes, derives maneuver labels from
+future motion kinematics, augments the data, and trains a 2-layer LSTM.
+
+Run on Jetson overnight:
+    cd ~/prism
+    /home/koushik-test/cad_pipeline_env/bin/python3 scripts/train_lstm_intent.py
+
+    # Custom output path
+    /home/koushik-test/cad_pipeline_env/bin/python3 scripts/train_lstm_intent.py \
+        --out /home/koushik-test/prism_data/checkpoints/lstm_intent/model.pt
+
+Data pipeline:
+    1. Follow per-instance annotation chains across all scenes
+    2. Transform each trajectory into ego-relative, heading-normalised features
+    3. Label the INPUT window from the FUTURE trajectory (what actually happened next)
+    4. Augment: Gaussian noise + speed scaling + random rotation
+    5. Train with class-weighted cross-entropy (rare maneuvers upweighted)
+
+Label derivation (from 5-frame future window at 2Hz = 2.5s lookahead):
+    stopping          — final speed < 0.3 m/s
+    braking           — mean deceleration < -0.4 m/s²
+    accelerating      — mean acceleration > +0.4 m/s²
+    turn_left/right   — mean heading change > 15°
+    lane_change_*     — significant lateral displacement (>0.8m) with forward motion
+    reversing         — net forward displacement < -0.3m
+    constant_velocity — none of the above
+"""
+
+import sys
+import argparse
+import json
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from pathlib import Path
+from collections import Counter
+from typing import List, Tuple, Optional
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from nuscenes.nuscenes import NuScenes
+from prism.predictive_engine.lstm_intent import (
+    LSTMIntentNet, TrajectoryBuffer, MANEUVERS,
+    SEQUENCE_LEN, INPUT_DIM, _normalise_trajectory,
+)
+
+NUSCENES_ROOT = "/home/koushik-test/prism_data/datasets/nuscenes"
+DEFAULT_OUT   = "/home/koushik-test/prism_data/checkpoints/lstm_intent/model.pt"
+
+FUTURE_LEN    = 5      # frames to look ahead for labelling
+MIN_TRAJ_LEN  = SEQUENCE_LEN + FUTURE_LEN
+ANNOTATED_HZ  = 2.0   # nuScenes annotations at 2Hz
+
+# Classes to include (ignore static objects)
+DYNAMIC_CATEGORIES = {
+    "vehicle.car", "vehicle.truck", "vehicle.bus",
+    "vehicle.motorcycle", "vehicle.bicycle",
+    "human.pedestrian.adult", "human.pedestrian.child",
+    "human.pedestrian.police_officer", "human.pedestrian.construction_worker",
+}
+
+VEHICLE_CATS = {c for c in DYNAMIC_CATEGORIES if c.startswith("vehicle")}
+PED_CATS     = {c for c in DYNAMIC_CATEGORIES if c.startswith("human")}
+
+
+# ── Trajectory extraction ─────────────────────────────────────────────────────
+
+def extract_trajectories(nusc: NuScenes) -> List[dict]:
+    """
+    Follow every annotation chain and return full trajectories in global frame.
+    Returns list of dicts:
+        {
+            "category": str,
+            "class":    str   (simplified: car/pedestrian/bicycle/etc),
+            "positions": np.ndarray  (N, 3)  xyz in global frame,
+            "timestamps": list[float]
+        }
+    """
+    trajectories = []
+    seen_instances = set()
+
+    for ann in nusc.sample_annotation:
+        itoken = ann["instance_token"]
+        if itoken in seen_instances:
+            continue
+        if ann["prev"] != "":
+            continue   # start from the first annotation of each instance
+
+        cat = ann["category_name"]
+        if not any(cat.startswith(c.split(".")[0] + "." + c.split(".")[1])
+                   for c in DYNAMIC_CATEGORIES):
+            continue
+
+        seen_instances.add(itoken)
+
+        # Follow annotation chain forward
+        positions  = []
+        timestamps = []
+        cur_token  = ann["token"]
+
+        while cur_token:
+            cur = nusc.get("sample_annotation", cur_token)
+            sample = nusc.get("sample", cur["sample_token"])
+            positions.append(cur["translation"])    # [x, y, z] global
+            timestamps.append(sample["timestamp"] / 1e6)
+            cur_token = cur["next"] if cur["next"] else None
+
+        if len(positions) < MIN_TRAJ_LEN:
+            continue
+
+        # Determine simplified class name
+        if cat.startswith("vehicle.car"):
+            cls = "car"
+        elif cat.startswith("vehicle.truck") or cat.startswith("vehicle.bus"):
+            cls = "truck"
+        elif cat.startswith("vehicle.motorcycle"):
+            cls = "motorcycle"
+        elif cat.startswith("vehicle.bicycle"):
+            cls = "bicycle"
+        elif cat.startswith("human.pedestrian"):
+            cls = "pedestrian"
+        else:
+            cls = "other"
+
+        trajectories.append({
+            "category":   cat,
+            "class":      cls,
+            "positions":  np.array(positions, dtype=np.float32),   # (N, 3)
+            "timestamps": timestamps,
+        })
+
+    print(f"  Extracted {len(trajectories)} valid trajectories")
+    counter = Counter(t["class"] for t in trajectories)
+    for cls, count in sorted(counter.items()):
+        print(f"    {cls:<15}: {count}")
+    return trajectories
+
+
+# ── Label derivation ──────────────────────────────────────────────────────────
+
+def derive_label(future_pos: np.ndarray) -> int:
+    """
+    Given future positions (M, 2) in xy global plane, return maneuver index.
+    Uses velocity and heading change over the future window.
+    """
+    if len(future_pos) < 2:
+        return 0   # constant_velocity fallback
+
+    # Velocities at each step (finite diff, m/s assuming 2Hz)
+    dt = 1.0 / ANNOTATED_HZ
+    vels = np.diff(future_pos, axis=0) / dt    # (M-1, 2)
+
+    speeds     = np.linalg.norm(vels, axis=1)  # (M-1,)
+    final_speed = speeds[-1]
+    mean_speed  = speeds.mean()
+
+    # Heading at each step (in radians)
+    headings = np.arctan2(vels[:, 0], vels[:, 1])  # lateral, forward
+
+    # Mean heading change per step (turn rate)
+    if len(headings) > 1:
+        heading_diffs = []
+        for i in range(1, len(headings)):
+            diff = headings[i] - headings[i - 1]
+            # Wrap to [-pi, pi]
+            diff = (diff + np.pi) % (2 * np.pi) - np.pi
+            heading_diffs.append(diff)
+        mean_turn = float(np.mean(np.abs(heading_diffs)))
+        signed_turn = float(np.mean(heading_diffs))
+    else:
+        mean_turn   = 0.0
+        signed_turn = 0.0
+
+    # Net displacement components
+    net_disp     = future_pos[-1] - future_pos[0]
+    net_forward  = float(net_disp[1])    # y-axis forward
+    net_lateral  = float(net_disp[0])    # x-axis lateral
+
+    # Acceleration over future window
+    if len(speeds) > 1:
+        accels = np.diff(speeds) / dt   # m/s²
+        mean_accel = float(accels.mean())
+    else:
+        mean_accel = 0.0
+
+    # ── Decision tree ──────────────────────────────
+
+    # Reversing: net backward displacement > 0.5m
+    if net_forward < -0.5 and mean_speed > 0.1:
+        return MANEUVERS.index("reversing")
+
+    # Stopping: final speed near zero
+    if final_speed < 0.3 and mean_speed < 1.0:
+        return MANEUVERS.index("stopping")
+
+    # Strong deceleration
+    if mean_accel < -0.5 and final_speed > 0.3:
+        return MANEUVERS.index("braking")
+
+    # Strong acceleration
+    if mean_accel > 0.5:
+        return MANEUVERS.index("accelerating")
+
+    # Turning — significant heading change (> 10 deg / step)
+    if mean_turn > np.radians(10.0):
+        if signed_turn > 0:
+            return MANEUVERS.index("turn_left")
+        else:
+            return MANEUVERS.index("turn_right")
+
+    # Lane change — significant lateral displacement with forward motion
+    if abs(net_lateral) > 0.8 and net_forward > 0.3:
+        if net_lateral < 0:
+            return MANEUVERS.index("lane_change_left")
+        else:
+            return MANEUVERS.index("lane_change_right")
+
+    return MANEUVERS.index("constant_velocity")
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
+class TrajectoryDataset(Dataset):
+    """
+    Sliding window dataset over nuScenes trajectories.
+    Each sample: (features (T, 6), label int)
+    """
+
+    def __init__(
+        self,
+        trajectories: List[dict],
+        augment: bool = True,
+        stride: int = 1,
+    ):
+        self.augment = augment
+        self.samples: List[Tuple[np.ndarray, int]] = []
+
+        for traj in trajectories:
+            positions  = traj["positions"][:, :2]  # (N, 2) xy only
+            n          = len(positions)
+
+            for start in range(0, n - MIN_TRAJ_LEN + 1, stride):
+                window     = positions[start : start + SEQUENCE_LEN]
+                future     = positions[start + SEQUENCE_LEN : start + SEQUENCE_LEN + FUTURE_LEN]
+                label      = derive_label(future)
+                features   = _normalise_trajectory(window)
+                self.samples.append((features, label))
+
+                # Augmentation: add noise copies
+                if augment:
+                    for _ in range(2):
+                        noisy   = window + np.random.randn(*window.shape).astype(np.float32) * 0.05
+                        aug_lab = derive_label(future)   # label unchanged
+                        aug_ft  = _normalise_trajectory(noisy)
+                        self.samples.append((aug_ft, aug_lab))
+
+                    # Speed scaling: compress/stretch trajectory
+                    for scale in [0.7, 1.3]:
+                        scaled = window * scale
+                        s_ft   = _normalise_trajectory(scaled)
+                        self.samples.append((s_ft, label))
+
+        print(f"  Dataset: {len(self.samples)} samples")
+        label_counts = Counter(s[1] for s in self.samples)
+        for idx, cnt in sorted(label_counts.items()):
+            pct = 100 * cnt / len(self.samples)
+            print(f"    {MANEUVERS[idx]:<22}: {cnt:4d} ({pct:.1f}%)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        features, label = self.samples[idx]
+        return torch.from_numpy(features), torch.tensor(label, dtype=torch.long)
+
+    def class_weights(self) -> torch.Tensor:
+        """Inverse-frequency weights for balanced training."""
+        counts = Counter(s[1] for s in self.samples)
+        total  = len(self.samples)
+        weights = torch.zeros(NUM_CLASSES := len(MANEUVERS))
+        for i in range(NUM_CLASSES):
+            weights[i] = total / max(counts.get(i, 1), 1)
+        return weights / weights.sum() * NUM_CLASSES
+
+
+# ── Training ──────────────────────────────────────────────────────────────────
+
+def train(args):
+    print("=" * 65)
+    print("PRISM — LSTM Intent Model Training")
+    print("=" * 65)
+
+    # Device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"  Device : {device}")
+
+    # Load nuScenes
+    print(f"\nLoading nuScenes from {args.data_root} ...")
+    nusc = NuScenes(version=args.version, dataroot=args.data_root, verbose=False)
+
+    # Extract trajectories
+    print("\nExtracting trajectories ...")
+    all_trajs = extract_trajectories(nusc)
+
+    if not all_trajs:
+        print("ERROR: No valid trajectories extracted. Check dataset path.")
+        return
+
+    # Train / val split by instance (not random sample split)
+    random.seed(42)
+    random.shuffle(all_trajs)
+    split = int(0.85 * len(all_trajs))
+    train_trajs = all_trajs[:split]
+    val_trajs   = all_trajs[split:]
+    print(f"\n  Train trajectories: {len(train_trajs)}")
+    print(f"  Val   trajectories: {len(val_trajs)}")
+
+    # Datasets
+    print("\nBuilding training dataset ...")
+    train_ds = TrajectoryDataset(train_trajs, augment=True, stride=1)
+    print("\nBuilding val dataset ...")
+    val_ds   = TrajectoryDataset(val_trajs,   augment=False, stride=2)
+
+    # Weighted sampler — oversample rare maneuvers
+    sample_weights = [train_ds.class_weights()[label].item()
+                      for _, label in train_ds.samples]
+    sampler = WeightedRandomSampler(sample_weights, len(train_ds), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              sampler=sampler, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=0)
+
+    # Model
+    model = LSTMIntentNet().to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel: {n_params:,} parameters")
+
+    # Loss — class-weighted cross entropy
+    class_w   = train_ds.class_weights().to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_w)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-5
+    )
+
+    # Output dir
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_val_acc = 0.0
+    history      = []
+
+    print(f"\nTraining for {args.epochs} epochs ...")
+    print(f"{'Epoch':<7} {'Train Loss':<12} {'Train Acc':<12} {'Val Loss':<12} {'Val Acc':<12}")
+    print("-" * 60)
+
+    for epoch in range(1, args.epochs + 1):
+        # ── Train ──
+        model.train()
+        train_loss, train_correct, train_total = 0.0, 0, 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss   = criterion(logits, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss    += loss.item() * x.size(0)
+            preds          = logits.argmax(dim=1)
+            train_correct += (preds == y).sum().item()
+            train_total   += x.size(0)
+
+        scheduler.step()
+        t_loss = train_loss / train_total
+        t_acc  = 100.0 * train_correct / train_total
+
+        # ── Validate ──
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                logits     = model(x)
+                loss       = criterion(logits, y)
+                val_loss  += loss.item() * x.size(0)
+                preds      = logits.argmax(dim=1)
+                val_correct += (preds == y).sum().item()
+                val_total   += x.size(0)
+
+        v_loss = val_loss / val_total if val_total > 0 else float("nan")
+        v_acc  = 100.0 * val_correct / val_total if val_total > 0 else 0.0
+
+        history.append({
+            "epoch": epoch, "train_loss": t_loss, "train_acc": t_acc,
+            "val_loss": v_loss, "val_acc": v_acc
+        })
+
+        marker = " ← best" if v_acc > best_val_acc else ""
+        print(f"{epoch:<7} {t_loss:<12.4f} {t_acc:<12.1f} {v_loss:<12.4f} {v_acc:<12.1f}{marker}")
+
+        if v_acc > best_val_acc:
+            best_val_acc = v_acc
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "val_acc": v_acc,
+                "val_loss": v_loss,
+                "train_acc": t_acc,
+                "train_loss": t_loss,
+                "maneuvers": MANEUVERS,
+                "input_dim": INPUT_DIM,
+                "seq_len": SEQUENCE_LEN,
+            }, out_path)
+
+    print(f"\nBest val accuracy: {best_val_acc:.1f}%")
+    print(f"Model saved to: {out_path}")
+
+    # Per-class breakdown on full val set
+    print("\nPer-class accuracy on val set:")
+    model.eval()
+    class_correct = Counter()
+    class_total   = Counter()
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y   = x.to(device), y.to(device)
+            preds  = model(x).argmax(dim=1)
+            for gt, pred in zip(y.cpu().numpy(), preds.cpu().numpy()):
+                class_total[int(gt)] += 1
+                if gt == pred:
+                    class_correct[int(gt)] += 1
+
+    for idx, name in enumerate(MANEUVERS):
+        total = class_total[idx]
+        if total > 0:
+            acc = 100.0 * class_correct[idx] / total
+            bar = "█" * int(acc / 5) + "░" * (20 - int(acc / 5))
+            print(f"  {name:<22} {bar}  {acc:5.1f}%  ({class_correct[idx]}/{total})")
+
+    # Save training history
+    hist_path = out_path.parent / "training_history.json"
+    with open(hist_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"\nTraining history: {hist_path}")
+    print("=" * 65)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="PRISM LSTM intent model training")
+    p.add_argument("--data-root", default=NUSCENES_ROOT)
+    p.add_argument("--version",   default="v1.0-mini")
+    p.add_argument("--out",       default=DEFAULT_OUT)
+    p.add_argument("--epochs",    type=int,   default=120)
+    p.add_argument("--lr",        type=float, default=3e-3)
+    p.add_argument("--batch-size",type=int,   default=64)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    train(parse_args())
