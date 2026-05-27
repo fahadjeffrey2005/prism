@@ -65,10 +65,31 @@ class VLMOutput:
     inference_time_ms: float = 0.0
     success: bool = False
 
+    # Caution → PRISM decision level mapping
+    _CAUTION_TO_DECISION = {
+        "normal":   "MONITOR",
+        "elevated": "EASE",
+        "high":     "CAUTION",
+        "critical": "STOP",
+    }
+
     @property
     def caution_level(self) -> int:
         mapping = {"normal": 0, "elevated": 1, "high": 2, "critical": 3}
         return mapping.get(self.recommended_caution, 0)
+
+    def to_arb_dict(self) -> dict:
+        """
+        Convert VLMOutput to the dict format expected by ArbitrationCore.update_vlm().
+        Maps recommended_caution → PRISM 8-level decision string.
+        """
+        return {
+            "decision":          self._CAUTION_TO_DECISION.get(self.recommended_caution, "MONITOR"),
+            "total_pedestrians": sum(1 for v in self.actor_intents.values() if "cross" in v or "ped" in v),
+            "total_vehicles":    sum(1 for v in self.actor_intents.values() if v not in ("crossing", "unknown")),
+            "primary_risk":      self.risk_flags[0] if self.risk_flags else "",
+            "reasoning":         self.scene_summary,
+        }
 
 
 # ── Divergence Monitor ────────────────────────────────────────────────────────
@@ -232,9 +253,9 @@ class VLMModel:
     Falls back gracefully if model unavailable.
     """
 
-    MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+    MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-    def __init__(self, device: str = "mps", enabled: bool = False):
+    def __init__(self, device: str = "cuda", enabled: bool = False):
         self.device = device
         self.model = None
         self.processor = None
@@ -557,16 +578,17 @@ class SemanticReasoner:
     """
 
     def __init__(self, cfg: dict):
-        sc_cfg = cfg.get("sensory_core", {})
-        device = sc_cfg.get("detection", {}).get("device", "mps")
+        vlm_cfg = cfg.get("vlm", {})
+        device  = vlm_cfg.get("device", "cuda")
 
         self.monitor = DivergenceMonitor(
-            divergence_threshold=cfg.get("vlm", {}).get("divergence_threshold", 0.35),
-            max_silence_s=cfg.get("vlm", {}).get("max_silence_s", 4.0),
-            cooldown_s=cfg.get("vlm", {}).get("cooldown_s", 0.4),
+            divergence_threshold=vlm_cfg.get("divergence_threshold", 0.35),
+            max_silence_s=vlm_cfg.get("max_silence_s", 4.0),
+            cooldown_s=vlm_cfg.get("cooldown_s", 0.4),
         )
         self.prompt_builder = PromptBuilder()
-        vlm_enabled = cfg.get("vlm", {}).get("enabled", False)
+        vlm_enabled = vlm_cfg.get("enabled", False)
+        VLMModel.MODEL_ID = vlm_cfg.get("model_id", VLMModel.MODEL_ID)
         self.vlm = VLMModel(device=device, enabled=vlm_enabled)
         self.worker = AsyncVLMWorker(self.vlm)
 

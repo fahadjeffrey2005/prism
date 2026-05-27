@@ -968,8 +968,8 @@ def main():
             predictor.update_vlm_intents(vlm_output.actor_intents)
 
         # Layer 5 — Arbitration Core (fuses all signals, produces audit trail)
-        if vlm_output and hasattr(vlm_output, "json_output") and vlm_output.json_output:
-            arbitrator.update_vlm(vlm_output.json_output)
+        if vlm_output is not None:
+            arbitrator.update_vlm(vlm_output.to_arb_dict())
         arb_decision = arbitrator.arbitrate(
             world_state, pred_state, scene, timestamp=world_state.timestamp
         )
@@ -979,7 +979,7 @@ def main():
         stats["frames"] += 1
         stats["times"].append(elapsed)
 
-        action = pred_state.recommended_action
+        action = arb_decision.action
         stats["actions"][action] = stats["actions"].get(action, 0) + 1
 
         for md in metric_dets:
@@ -996,13 +996,14 @@ def main():
                 if gt_dist:
                     validator.add_sample(md.distance_m, gt_dist)
 
-        # Log
+        # Log — show Arbitration Core decision with dominant signal + SmartDecision context
         logger.info(
             f"Frame {stats['frames']:3d} | {elapsed:.0f}ms | "
-            f"{scene.decision:<9} {int(scene.speed_factor*100)}% | "
+            f"[ARB] {arb_decision.action:<9} {int(arb_decision.speed_factor*100)}% "
+            f"conf={arb_decision.confidence*100:.0f}% dom={arb_decision.dominant_signal} | "
             f"peds:{scene.ped_count} veh:{scene.vehicle_count} | "
             f"closest:{scene.closest_threat_m:.1f}m | "
-            f"{scene.primary_reason[:45]}"
+            f"{scene.primary_reason[:40]}"
         )
 
         # Visualise
@@ -1057,10 +1058,15 @@ def main():
     logger.info(f"Frames:       {stats['frames']}")
     logger.info(f"Avg FPS:      {1000/np.mean(stats['times']):.1f}")
     logger.info(f"Avg latency:  {np.mean(stats['times']):.0f}ms")
-    logger.info(f"\nActions taken:")
-    for action, count in sorted(stats["actions"].items()):
+    logger.info(f"\nArbitration decisions:")
+    _ARB_ORDER = ["CLEAR", "MONITOR", "EASE", "SLOW", "CAUTION", "YIELD", "STOP", "EMERGENCY"]
+    for action in _ARB_ORDER:
+        count = stats["actions"].get(action, 0)
+        if count == 0:
+            continue
         pct = count / stats["frames"] * 100
-        logger.info(f"  {action:<12} {count:3d} ({pct:.0f}%)")
+        bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
+        logger.info(f"  {action:<12} {bar}  {count:3d} ({pct:.0f}%)")
     logger.info(f"\nThreat zones:")
     for zone, count in stats["threat_zones"].items():
         logger.info(f"  {zone:<10} {count:3d}")
