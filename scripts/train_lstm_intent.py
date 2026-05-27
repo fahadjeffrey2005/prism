@@ -147,6 +147,10 @@ def derive_label(future_pos: np.ndarray) -> int:
     """
     Given future positions (M, 2) in xy global plane, return maneuver index.
     Uses velocity and heading change over the future window.
+
+    IMPORTANT: forward/lateral are defined relative to the actor's OWN initial
+    heading, NOT the global y-axis. This prevents cars heading SW from being
+    mislabelled as 'reversing' just because their y-displacement is negative.
     """
     if len(future_pos) < 2:
         return 0   # constant_velocity fallback
@@ -155,12 +159,27 @@ def derive_label(future_pos: np.ndarray) -> int:
     dt = 1.0 / ANNOTATED_HZ
     vels = np.diff(future_pos, axis=0) / dt    # (M-1, 2)
 
-    speeds     = np.linalg.norm(vels, axis=1)  # (M-1,)
+    speeds      = np.linalg.norm(vels, axis=1)  # (M-1,)
     final_speed = speeds[-1]
     mean_speed  = speeds.mean()
 
-    # Heading at each step (in radians)
-    headings = np.arctan2(vels[:, 0], vels[:, 1])  # lateral, forward
+    # Actor's initial heading unit vector (from first motion step)
+    # Falls back to [0,1] (global y) if actor is stationary
+    first_vel = vels[0]
+    first_speed = float(np.linalg.norm(first_vel))
+    if first_speed > 0.05:
+        heading_fwd  = first_vel / first_speed          # forward unit vector
+    else:
+        heading_fwd  = np.array([0.0, 1.0], dtype=np.float32)
+    heading_lat = np.array([-heading_fwd[1], heading_fwd[0]])  # left perpendicular
+
+    # Net displacement projected onto actor-relative axes
+    net_disp    = future_pos[-1] - future_pos[0]
+    net_forward = float(np.dot(net_disp, heading_fwd))   # +ve = actor moved forward
+    net_lateral = float(np.dot(net_disp, heading_lat))   # +ve = actor moved left
+
+    # Heading at each step (in radians) — for turn detection
+    headings = np.arctan2(vels[:, 0], vels[:, 1])
 
     # Mean heading change per step (turn rate)
     if len(headings) > 1:
@@ -170,27 +189,22 @@ def derive_label(future_pos: np.ndarray) -> int:
             # Wrap to [-pi, pi]
             diff = (diff + np.pi) % (2 * np.pi) - np.pi
             heading_diffs.append(diff)
-        mean_turn = float(np.mean(np.abs(heading_diffs)))
+        mean_turn   = float(np.mean(np.abs(heading_diffs)))
         signed_turn = float(np.mean(heading_diffs))
     else:
         mean_turn   = 0.0
         signed_turn = 0.0
 
-    # Net displacement components
-    net_disp     = future_pos[-1] - future_pos[0]
-    net_forward  = float(net_disp[1])    # y-axis forward
-    net_lateral  = float(net_disp[0])    # x-axis lateral
-
     # Acceleration over future window
     if len(speeds) > 1:
-        accels = np.diff(speeds) / dt   # m/s²
+        accels     = np.diff(speeds) / dt   # m/s²
         mean_accel = float(accels.mean())
     else:
         mean_accel = 0.0
 
     # ── Decision tree ──────────────────────────────
 
-    # Reversing: net backward displacement > 0.5m
+    # Reversing: actor moved backward along its own heading axis
     if net_forward < -0.5 and mean_speed > 0.1:
         return MANEUVERS.index("reversing")
 
