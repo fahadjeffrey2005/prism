@@ -209,8 +209,10 @@ def derive_label(future_pos: np.ndarray) -> int:
         return MANEUVERS.index("reversing")
 
     # Stopping: final speed near zero.
-    # Tightened: mean_speed < 0.4 excludes slow walkers (0.4-1.0 m/s → constant_velocity)
-    if final_speed < 0.15 and mean_speed < 0.4:
+    # Intermediate threshold: tighter than original (0.3/1.0) to reduce parked-car
+    # dominance, but not so tight that slow-moving actors become ambiguous CV samples.
+    # Slow walkers (0.7-1.0 m/s) stay constant_velocity; only near-zero actors labelled stopping.
+    if final_speed < 0.25 and mean_speed < 0.7:
         return MANEUVERS.index("stopping")
 
     # Strong deceleration
@@ -324,7 +326,7 @@ class TrajectoryDataset(Dataset):
         stop_idx      = MANEUVERS.index("stopping")
         other_counts  = [v for k, v in label_counts.items() if k != stop_idx and v > 0]
         if other_counts and label_counts.get(stop_idx, 0) > 0:
-            cap = int(3 * float(np.mean(other_counts)))
+            cap = int(4 * float(np.mean(other_counts)))
             current_stop = label_counts[stop_idx]
             if current_stop > cap:
                 stop_indices  = [i for i, s in enumerate(self.samples) if s[1] == stop_idx]
@@ -454,7 +456,7 @@ def train(args):
     # ConfusionPenaltyCELoss was removed: register_buffer override corrupted
     # nn.Module and label_smoothing+weight interaction caused gradient collapse.
     class_w   = train_ds.class_weights().to(device)
-    criterion = FocalLoss(gamma=2.0, weight=class_w)
+    criterion = FocalLoss(gamma=1.5, weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
@@ -567,7 +569,7 @@ def parse_args():
     p.add_argument("--data-root",  default=NUSCENES_ROOT)
     p.add_argument("--version",    default="v1.0-mini")
     p.add_argument("--out",        default=DEFAULT_OUT)
-    p.add_argument("--epochs",     type=int,   default=200)
+    p.add_argument("--epochs",     type=int,   default=250)
     p.add_argument("--lr",         type=float, default=3e-3)
     p.add_argument("--batch-size", type=int,   default=64)
     p.add_argument("--bdd-npz",    default=None,
