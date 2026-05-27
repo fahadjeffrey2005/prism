@@ -209,7 +209,8 @@ def derive_label(future_pos: np.ndarray) -> int:
         return MANEUVERS.index("reversing")
 
     # Stopping: final speed near zero.
-    if final_speed < 0.3 and mean_speed < 1.0:
+    # Tightened: mean_speed < 0.4 excludes slow walkers (0.4-1.0 m/s → constant_velocity)
+    if final_speed < 0.15 and mean_speed < 0.4:
         return MANEUVERS.index("stopping")
 
     # Strong deceleration
@@ -220,9 +221,13 @@ def derive_label(future_pos: np.ndarray) -> int:
     if mean_accel > 0.5:
         return MANEUVERS.index("accelerating")
 
-    # Turning — significant heading change (> 10 deg / step)
-    if mean_turn > np.radians(10.0):
-        if signed_turn > 0:
+    # Turning — significant heading change (> 7 deg / step at 2Hz)
+    # Bearing convention: arctan2(vx, vy) increases clockwise (east = +x = right)
+    # so signed_turn > 0 means actor curved RIGHT, signed_turn < 0 means LEFT.
+    # BUG-FIX: was signed_turn > 0 → turn_left (backwards). Verified:
+    #   actor going north (+y), turns west (-x) → headings go 0 → -π/2 → diffs < 0
+    if mean_turn > np.radians(7.0):
+        if signed_turn < 0:
             return MANEUVERS.index("turn_left")
         else:
             return MANEUVERS.index("turn_right")
@@ -312,6 +317,27 @@ class TrajectoryDataset(Dataset):
         for idx, cnt in sorted(label_counts.items()):
             pct = 100 * cnt / len(self.samples)
             print(f"    {MANEUVERS[idx]:<22}: {cnt:4d} ({pct:.1f}%)")
+
+        # ── Hard cap: stopping ≤ 3× mean count of other non-empty classes ──────
+        # WeightedRandomSampler alone can't prevent the model from developing a
+        # stopping bias when stopping is 50%+ of raw samples.  Cap it first.
+        stop_idx      = MANEUVERS.index("stopping")
+        other_counts  = [v for k, v in label_counts.items() if k != stop_idx and v > 0]
+        if other_counts and label_counts.get(stop_idx, 0) > 0:
+            cap = int(3 * float(np.mean(other_counts)))
+            current_stop = label_counts[stop_idx]
+            if current_stop > cap:
+                stop_indices  = [i for i, s in enumerate(self.samples) if s[1] == stop_idx]
+                keep_stop     = set(random.sample(stop_indices, cap))
+                self.samples  = [s for i, s in enumerate(self.samples)
+                                 if s[1] != stop_idx or i in keep_stop]
+                random.shuffle(self.samples)
+                print(f"  Stopping capped: {current_stop} → {cap}  "
+                      f"(3× mean of other classes)")
+                label_counts_after = Counter(s[1] for s in self.samples)
+                for idx2, cnt2 in sorted(label_counts_after.items()):
+                    pct2 = 100 * cnt2 / len(self.samples)
+                    print(f"    {MANEUVERS[idx2]:<22}: {cnt2:4d} ({pct2:.1f}%)")
 
     def __len__(self):
         return len(self.samples)
@@ -422,11 +448,13 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — class-weighted cross entropy (proven stable at 78% Phase 1).
+    # Loss — Focal loss with class weights.
+    # gamma=2 strongly down-weights easy stopping predictions, forcing the model
+    # to focus on rare hard classes (turns, lane changes, braking).
     # ConfusionPenaltyCELoss was removed: register_buffer override corrupted
     # nn.Module and label_smoothing+weight interaction caused gradient collapse.
     class_w   = train_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    criterion = FocalLoss(gamma=2.0, weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
