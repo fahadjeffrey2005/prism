@@ -160,12 +160,17 @@ def _normalise_trajectory(pos: np.ndarray) -> np.ndarray:
     # Translate so first frame is at origin
     pos = pos - pos[0]
 
-    # Rotate so the net displacement is along +y
+    # Rotate so the net displacement is along +y.
+    # angle = clockwise angle of disp from +y axis.
+    # To bring disp onto +y we rotate COUNTER-CLOCKWISE by +angle → R(+angle).
+    # R(+angle) = [[cos, -sin], [sin, cos]]
+    # BUG-FIX: was R(-angle) which flipped left/right, causing 100% lane_change
+    # direction confusion. Verified: R(+π/2) @ [1,0] = [0,1] ✓
     disp = pos[-1] - pos[0]
     dist = np.linalg.norm(disp)
     if dist > 0.05:
-        angle = np.arctan2(disp[0], disp[1])   # angle from +y axis
-        c, s  = np.cos(-angle), np.sin(-angle)
+        angle = np.arctan2(disp[0], disp[1])   # clockwise angle from +y axis
+        c, s  = np.cos(angle), np.sin(angle)   # +angle (was: -angle — wrong sign)
         R     = np.array([[c, -s], [s, c]], dtype=np.float32)
         pos   = (R @ pos.T).T                   # (T, 2)
 
@@ -218,7 +223,67 @@ class LSTMIntentPredictor:
             logits = self.model(x)                          # (1, 9)
             probs  = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 
+        probs = self._physics_filter(probs)
         self._probs = probs
+        return probs
+
+    def _physics_filter(self, probs: np.ndarray) -> np.ndarray:
+        """
+        Suppress physically impossible predictions using recent buffer state.
+
+        Rules (all independent):
+          1. Reversing requires sustained backward motion. If the actor's net
+             displacement over the buffer is clearly forward (>0.2m), zero out
+             reversing probability and redistribute to stopping.
+          2. Lane-change requires meaningful forward speed. If mean speed < 0.5m/s
+             (nearly stationary), suppress both lane_change classes.
+
+        These are hard physical constraints — they should never fire on a correct
+        prediction, only on the model's spurious over-activations.
+        """
+        if len(self.buffer._positions) < 2:
+            return probs
+
+        probs = probs.copy()
+        positions = np.array(self.buffer._positions, dtype=np.float32)
+
+        # Compute net displacement and mean speed from raw positions
+        net_disp   = positions[-1] - positions[0]
+        dt_approx  = 0.5   # nuScenes annotations at 2Hz
+        vels       = np.diff(positions, axis=0) / dt_approx
+        mean_speed = float(np.linalg.norm(vels, axis=1).mean()) if len(vels) > 0 else 0.0
+
+        # Actor's heading direction (first motion step)
+        if len(vels) > 0 and np.linalg.norm(vels[0]) > 0.05:
+            heading_fwd = vels[0] / np.linalg.norm(vels[0])
+        else:
+            heading_fwd = np.array([0.0, 1.0], dtype=np.float32)
+
+        net_forward = float(np.dot(net_disp, heading_fwd))
+
+        rev_idx   = MANEUVERS.index("reversing")
+        stop_idx  = MANEUVERS.index("stopping")
+        lcl_idx   = MANEUVERS.index("lane_change_left")
+        lcr_idx   = MANEUVERS.index("lane_change_right")
+
+        # Rule 1: suppress reversing if actor has been moving forward
+        if net_forward > 0.2:
+            suppressed        = probs[rev_idx]
+            probs[rev_idx]    = 0.0
+            probs[stop_idx]  += suppressed   # redistribute to stopping
+
+        # Rule 2: suppress lane changes if nearly stationary
+        if mean_speed < 0.5:
+            for idx in (lcl_idx, lcr_idx):
+                suppressed     = probs[idx]
+                probs[idx]     = 0.0
+                probs[stop_idx] += suppressed
+
+        # Re-normalise to sum to 1
+        total = probs.sum()
+        if total > 1e-6:
+            probs /= total
+
         return probs
 
     @property

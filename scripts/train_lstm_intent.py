@@ -208,8 +208,11 @@ def derive_label(future_pos: np.ndarray) -> int:
     if net_forward < -0.5 and mean_speed > 0.1:
         return MANEUVERS.index("reversing")
 
-    # Stopping: final speed near zero
-    if final_speed < 0.3 and mean_speed < 1.0:
+    # Stopping: final speed near zero.
+    # Threshold raised to 3.0 m/s so hard-braking-to-stop (mean≈2.5 m/s)
+    # is captured. Was 1.0 m/s — too tight, caused braking-to-stop to fall
+    # through to constant_velocity.
+    if final_speed < 0.3 and mean_speed < 3.0:
         return MANEUVERS.index("stopping")
 
     # Strong deceleration
@@ -227,9 +230,12 @@ def derive_label(future_pos: np.ndarray) -> int:
         else:
             return MANEUVERS.index("turn_right")
 
-    # Lane change — significant lateral displacement with forward motion
+    # Lane change — significant lateral displacement with forward motion.
+    # heading_lat points LEFT, so net_lateral > 0 means actor moved LEFT.
+    # BUG-FIX: was net_lateral < 0 → lane_change_left (backwards — negative
+    # means rightward). Matches run_benchmark._derive_label convention.
     if abs(net_lateral) > 0.8 and net_forward > 0.3:
-        if net_lateral < 0:
+        if net_lateral > 0:
             return MANEUVERS.index("lane_change_left")
         else:
             return MANEUVERS.index("lane_change_right")
@@ -241,19 +247,21 @@ def derive_label(future_pos: np.ndarray) -> int:
 
 class TrajectoryDataset(Dataset):
     """
-    Sliding window dataset over nuScenes trajectories.
+    Sliding window dataset over nuScenes trajectories + optional BDD100K npz.
     Each sample: (features (T, 6), label int)
     """
 
     def __init__(
         self,
         trajectories: List[dict],
-        augment: bool = True,
-        stride: int = 1,
+        augment:      bool = True,
+        stride:       int  = 1,
+        bdd_npz_path: Optional[str] = None,
     ):
         self.augment = augment
         self.samples: List[Tuple[np.ndarray, int]] = []
 
+        # ── nuScenes trajectories ──────────────────────────────────────────
         for traj in trajectories:
             positions  = traj["positions"][:, :2]  # (N, 2) xy only
             n          = len(positions)
@@ -268,10 +276,9 @@ class TrajectoryDataset(Dataset):
                 # Augmentation: add noise copies
                 if augment:
                     for _ in range(2):
-                        noisy   = window + np.random.randn(*window.shape).astype(np.float32) * 0.05
-                        aug_lab = derive_label(future)   # label unchanged
-                        aug_ft  = _normalise_trajectory(noisy)
-                        self.samples.append((aug_ft, aug_lab))
+                        noisy  = window + np.random.randn(*window.shape).astype(np.float32) * 0.05
+                        aug_ft = _normalise_trajectory(noisy)
+                        self.samples.append((aug_ft, label))
 
                     # Speed scaling: compress/stretch trajectory
                     for scale in [0.7, 1.3]:
@@ -279,7 +286,31 @@ class TrajectoryDataset(Dataset):
                         s_ft   = _normalise_trajectory(scaled)
                         self.samples.append((s_ft, label))
 
-        print(f"  Dataset: {len(self.samples)} samples")
+        nuscenes_count = len(self.samples)
+
+        # ── BDD100K pre-extracted windows (optional) ───────────────────────
+        bdd_count = 0
+        if bdd_npz_path:
+            bdd_path = Path(bdd_npz_path)
+            if bdd_path.exists():
+                data = np.load(bdd_path, allow_pickle=True)
+                bdd_feats  = data["features"]   # (N, T, 6)
+                bdd_labels = data["labels"]      # (N,)
+                for feat, label in zip(bdd_feats, bdd_labels):
+                    if feat.shape == (SEQUENCE_LEN, 6):
+                        self.samples.append((feat.astype(np.float32), int(label)))
+                        bdd_count += 1
+                        # Light augmentation on BDD too
+                        if augment and random.random() < 0.5:
+                            noisy = feat + np.random.randn(*feat.shape).astype(np.float32) * 0.03
+                            self.samples.append((noisy, int(label)))
+                            bdd_count += 1
+                print(f"  BDD100K windows loaded: {bdd_count}")
+            else:
+                print(f"  ⚠  BDD100K npz not found: {bdd_path} — training on nuScenes only")
+
+        print(f"  Dataset: {len(self.samples)} samples  "
+              f"(nuScenes={nuscenes_count}  BDD100K={bdd_count})")
         label_counts = Counter(s[1] for s in self.samples)
         for idx, cnt in sorted(label_counts.items()):
             pct = 100 * cnt / len(self.samples)
@@ -335,6 +366,60 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
+# ── Confusion-penalty loss ────────────────────────────────────────────────────
+
+class ConfusionPenaltyCELoss(nn.Module):
+    """
+    Cross-entropy with label smoothing + explicit confusion penalties.
+
+    For each (gt, wrong_pred) pair, when gt is the true class and the model
+    assigns high probability to wrong_pred, the loss is multiplied by
+    penalty_multiplier. This directly discourages the known confusion pairs:
+        stopping → reversing  (×3)
+        lane_change_left ↔ lane_change_right (×3)
+
+    Label smoothing 0.05 prevents overconfidence on dominant classes
+    (constant_velocity dominated Phase 1 training at 36.7%).
+    """
+
+    def __init__(
+        self,
+        weight:          Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.05,
+        penalty_pairs:   list  = None,
+        device:          str   = "cpu",
+    ):
+        super().__init__()
+        self.weight          = weight
+        self.label_smoothing = label_smoothing
+        self.penalty_pairs   = penalty_pairs or []
+        self.n_classes       = len(MANEUVERS)
+
+        # Build penalty matrix: penalty_mat[gt, wrong] = extra_multiplier
+        pm = torch.ones(self.n_classes, self.n_classes, device=device)
+        for gt, wrong, mult in self.penalty_pairs:
+            pm[gt, wrong] = mult
+        self.register_buffer = None   # no buffers needed
+        self.penalty_mat = pm
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Standard cross-entropy with label smoothing
+        base_loss = nn.functional.cross_entropy(
+            logits, targets,
+            weight          = self.weight,
+            label_smoothing = self.label_smoothing,
+            reduction       = "none",
+        )   # (B,)
+
+        # Confusion penalty: for each sample, scale loss by the penalty
+        # associated with (true_class, predicted_class)
+        with torch.no_grad():
+            preds    = logits.argmax(dim=-1)         # (B,)
+            penalties = self.penalty_mat[targets, preds]  # (B,)
+
+        return (base_loss * penalties).mean()
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
@@ -373,8 +458,9 @@ def train(args):
     print(f"  Val   trajectories: {len(val_trajs)}")
 
     # Datasets
+    bdd_npz = args.bdd_npz if args.bdd_npz else None
     print("\nBuilding training dataset ...")
-    train_ds = TrajectoryDataset(train_trajs, augment=True, stride=1)
+    train_ds = TrajectoryDataset(train_trajs, augment=True,  stride=1, bdd_npz_path=bdd_npz)
     print("\nBuilding val dataset ...")
     val_ds   = TrajectoryDataset(val_trajs,   augment=False, stride=2)
 
@@ -393,9 +479,22 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — class-weighted cross entropy
+    # Loss — class-weighted cross entropy with label smoothing.
+    # Label smoothing 0.05 reduces overconfidence on dominant classes.
+    # confusion_penalty extra-penalises stopping→reversing and
+    # lane_change_left↔right swaps (the two confirmed confusion pairs).
     class_w   = train_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    criterion = ConfusionPenaltyCELoss(
+        weight          = class_w,
+        label_smoothing = 0.05,
+        penalty_pairs   = [
+            # (gt_class, wrong_pred_class, extra_penalty_multiplier)
+            (MANEUVERS.index("stopping"),         MANEUVERS.index("reversing"),        3.0),
+            (MANEUVERS.index("lane_change_left"),  MANEUVERS.index("lane_change_right"),3.0),
+            (MANEUVERS.index("lane_change_right"), MANEUVERS.index("lane_change_left"), 3.0),
+        ],
+        device = device,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
@@ -505,12 +604,15 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="PRISM LSTM intent model training")
-    p.add_argument("--data-root", default=NUSCENES_ROOT)
-    p.add_argument("--version",   default="v1.0-mini")
-    p.add_argument("--out",       default=DEFAULT_OUT)
-    p.add_argument("--epochs",    type=int,   default=120)
-    p.add_argument("--lr",        type=float, default=3e-3)
-    p.add_argument("--batch-size",type=int,   default=64)
+    p.add_argument("--data-root",  default=NUSCENES_ROOT)
+    p.add_argument("--version",    default="v1.0-mini")
+    p.add_argument("--out",        default=DEFAULT_OUT)
+    p.add_argument("--epochs",     type=int,   default=120)
+    p.add_argument("--lr",         type=float, default=3e-3)
+    p.add_argument("--batch-size", type=int,   default=64)
+    p.add_argument("--bdd-npz",    default=None,
+                   help="Path to BDD100K pre-extracted trajectories .npz "
+                        "(from scripts/prepare_bdd100k.py). Optional.")
     return p.parse_args()
 
 
