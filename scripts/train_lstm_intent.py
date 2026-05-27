@@ -209,9 +209,7 @@ def derive_label(future_pos: np.ndarray) -> int:
         return MANEUVERS.index("reversing")
 
     # Stopping: final speed near zero.
-    # mean_speed < 1.5 — captures slow-crawl-to-stop without pulling in
-    # hard-braking events (those are caught by the braking check below).
-    if final_speed < 0.3 and mean_speed < 1.5:
+    if final_speed < 0.3 and mean_speed < 1.0:
         return MANEUVERS.index("stopping")
 
     # Strong deceleration
@@ -541,7 +539,7 @@ def parse_args():
     p.add_argument("--data-root",  default=NUSCENES_ROOT)
     p.add_argument("--version",    default="v1.0-mini")
     p.add_argument("--out",        default=DEFAULT_OUT)
-    p.add_argument("--epochs",     type=int,   default=120)
+    p.add_argument("--epochs",     type=int,   default=200)
     p.add_argument("--lr",         type=float, default=3e-3)
     p.add_argument("--batch-size", type=int,   default=64)
     p.add_argument("--bdd-npz",    default=None,
