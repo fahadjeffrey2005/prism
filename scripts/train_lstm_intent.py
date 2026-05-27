@@ -20,12 +20,12 @@ Data pipeline:
     5. Train with class-weighted cross-entropy (rare maneuvers upweighted)
 
 Label derivation (from 5-frame future window at 2Hz = 2.5s lookahead):
-    stopping          — final speed < 0.3 m/s
-    braking           — mean deceleration < -0.4 m/s²
-    accelerating      — mean acceleration > +0.4 m/s²
-    turn_left/right   — mean heading change > 15°
-    lane_change_*     — significant lateral displacement (>0.8m) with forward motion
-    reversing         — net forward displacement < -0.3m
+    reversing         — net backward displacement > 0.5m
+    turn_left/right   — mean heading change > 7° per step (checked BEFORE stopping)
+    lane_change_*     — lateral displacement > 0.8m with forward motion > 0.3m
+    stopping          — final speed < 0.15 m/s AND mean speed < 0.4 m/s
+    braking           — mean deceleration < -0.5 m/s² while still moving
+    accelerating      — mean acceleration > +0.5 m/s²
     constant_velocity — none of the above
 """
 
@@ -203,47 +203,53 @@ def derive_label(future_pos: np.ndarray) -> int:
         mean_accel = 0.0
 
     # ── Decision tree ──────────────────────────────
+    #
+    # ORDER MATTERS: stopping is checked LAST among the motion classes.
+    # Previously stopping was checked first, which meant any slow actor that was
+    # ALSO turning got captured by the stopping check and never reached the turn
+    # check.  This resulted in turn_left/right being 0% accuracy.
+    # Correct order: reversing → turning → lane_change → braking → accelerating
+    #                → stopping → constant_velocity.
 
-    # Reversing: actor moved backward along its own heading axis
+    # 1. Reversing: actor moved backward along its own heading axis
     if net_forward < -0.5 and mean_speed > 0.1:
         return MANEUVERS.index("reversing")
 
-    # Stopping: final speed near zero.
-    # Intermediate threshold: tighter than original (0.3/1.0) to reduce parked-car
-    # dominance, but not so tight that slow-moving actors become ambiguous CV samples.
-    # Slow walkers (0.7-1.0 m/s) stay constant_velocity; only near-zero actors labelled stopping.
-    if final_speed < 0.25 and mean_speed < 0.7:
-        return MANEUVERS.index("stopping")
-
-    # Strong deceleration
-    if mean_accel < -0.5 and final_speed > 0.3:
-        return MANEUVERS.index("braking")
-
-    # Strong acceleration
-    if mean_accel > 0.5:
-        return MANEUVERS.index("accelerating")
-
-    # Turning — significant heading change (> 7 deg / step at 2Hz)
-    # Bearing convention: arctan2(vx, vy) increases clockwise (east = +x = right)
-    # so signed_turn > 0 means actor curved RIGHT, signed_turn < 0 means LEFT.
-    # BUG-FIX: was signed_turn > 0 → turn_left (backwards). Verified:
-    #   actor going north (+y), turns west (-x) → headings go 0 → -π/2 → diffs < 0
+    # 2. Turning — checked BEFORE stopping so turning actors aren't stolen.
+    # Bearing: arctan2(vx, vy) increases clockwise, so:
+    #   signed_turn < 0 → actor curved LEFT (heading decreased toward west)
+    #   signed_turn > 0 → actor curved RIGHT
+    # BUG-FIX: was signed_turn > 0 → turn_left (backwards). Fixed in prior run.
     if mean_turn > np.radians(7.0):
         if signed_turn < 0:
             return MANEUVERS.index("turn_left")
         else:
             return MANEUVERS.index("turn_right")
 
-    # Lane change — significant lateral displacement with forward motion.
-    # heading_lat points LEFT, so net_lateral > 0 means actor moved LEFT.
-    # BUG-FIX: was net_lateral < 0 → lane_change_left (backwards — negative
-    # means rightward). Matches run_benchmark._derive_label convention.
+    # 3. Lane change — checked BEFORE stopping.
+    # heading_lat points LEFT, net_lateral > 0 means actor moved LEFT.
+    # BUG-FIX: was net_lateral < 0 → lane_change_left (backwards). Fixed prior.
     if abs(net_lateral) > 0.8 and net_forward > 0.3:
         if net_lateral > 0:
             return MANEUVERS.index("lane_change_left")
         else:
             return MANEUVERS.index("lane_change_right")
 
+    # 4. Stopping: final speed near zero AND not turning/lane-changing.
+    # Tight threshold: parked cars and actors decelerating to a full stop only.
+    # Slow walkers (0.15–1.0 m/s) fall through to constant_velocity or braking.
+    if final_speed < 0.15 and mean_speed < 0.4:
+        return MANEUVERS.index("stopping")
+
+    # 5. Strong deceleration (still moving)
+    if mean_accel < -0.5 and final_speed > 0.15:
+        return MANEUVERS.index("braking")
+
+    # 6. Strong acceleration
+    if mean_accel > 0.5:
+        return MANEUVERS.index("accelerating")
+
+    # 7. Default
     return MANEUVERS.index("constant_velocity")
 
 
@@ -450,13 +456,12 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — Focal loss with class weights.
-    # gamma=2 strongly down-weights easy stopping predictions, forcing the model
-    # to focus on rare hard classes (turns, lane changes, braking).
-    # ConfusionPenaltyCELoss was removed: register_buffer override corrupted
-    # nn.Module and label_smoothing+weight interaction caused gradient collapse.
+    # Loss — class-weighted cross-entropy (proven stable).
+    # FocalLoss was tried at gamma=1.5 and 2.0 but introduced convergence noise —
+    # turn accuracy varied 10+ points between identical runs.  CE+class_weights is
+    # the reliable baseline.
     class_w   = train_ds.class_weights().to(device)
-    criterion = FocalLoss(gamma=1.5, weight=class_w)
+    criterion = nn.CrossEntropyLoss(weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
@@ -569,7 +574,7 @@ def parse_args():
     p.add_argument("--data-root",  default=NUSCENES_ROOT)
     p.add_argument("--version",    default="v1.0-mini")
     p.add_argument("--out",        default=DEFAULT_OUT)
-    p.add_argument("--epochs",     type=int,   default=250)
+    p.add_argument("--epochs",     type=int,   default=300)
     p.add_argument("--lr",         type=float, default=3e-3)
     p.add_argument("--batch-size", type=int,   default=64)
     p.add_argument("--bdd-npz",    default=None,
