@@ -457,12 +457,13 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — class-weighted cross-entropy (proven stable).
-    # FocalLoss was tried at gamma=1.5 and 2.0 but introduced convergence noise —
-    # turn accuracy varied 10+ points between identical runs.  CE+class_weights is
-    # the reliable baseline.
-    class_w   = train_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    # Loss — uniform cross-entropy.  WeightedRandomSampler (below) already
+    # balances class frequency in every batch.  Adding class_w on top was
+    # double-counting: sampler over-represents rare classes AND loss amplifies
+    # their gradients, causing the model to over-index on them and collapse
+    # (stopping went from 18% → 12% when both were active).  Sampler alone is
+    # the standard approach for imbalanced classification.
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
