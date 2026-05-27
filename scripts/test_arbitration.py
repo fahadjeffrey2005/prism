@@ -169,7 +169,7 @@ def main():
             camera_name=frame_data["camera_name"],
             timestamp=timestamp,
         )
-        metric_dets  = metric_engine.process_frame(image, sensory_frame.detections)
+        metric_dets, _ = metric_engine.process_frame(image, sensory_frame.detections)
         world_state  = world.update(sensory_frame, calibration=calib)
         pred_state   = predictor.update(world_state, metric_dets)
         scene        = decision_engine.assess(world_state, pred_state, metric_dets)
