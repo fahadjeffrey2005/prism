@@ -457,13 +457,13 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — uniform cross-entropy.  WeightedRandomSampler (below) already
-    # balances class frequency in every batch.  Adding class_w on top was
-    # double-counting: sampler over-represents rare classes AND loss amplifies
-    # their gradients, causing the model to over-index on them and collapse
-    # (stopping went from 18% → 12% when both were active).  Sampler alone is
-    # the standard approach for imbalanced classification.
-    criterion = nn.CrossEntropyLoss()
+    # Loss — uniform CE with label smoothing=0.1.
+    # WeightedRandomSampler already handles class balance; class_w was removed
+    # (double-counting caused stopping to drop from 18% to 12%).
+    # label_smoothing=0.1 prevents the model from becoming overconfident on the
+    # small training set (500 trajectories), which is what causes val accuracy to
+    # oscillate between epochs rather than converge stably.
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
