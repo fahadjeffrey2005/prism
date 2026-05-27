@@ -41,6 +41,7 @@ from prism.world_model.world_model import WorldModel, WorldModelVisualizer
 from prism.predictive_engine.engine import PredictiveEngine, MANEUVERS
 from prism.predictive_engine.decision import SmartDecisionEngine, DECISIONS, PED_STATES
 from prism.semantic_reasoner.reasoner import SemanticReasoner
+from prism.arbitration.core import ArbitrationCore
 
 logger = get_logger("run_predictive")
 
@@ -894,7 +895,8 @@ def main():
     logger.info(f"Scene: {scene_info['name']} — {scene_info['description']}")
 
     decision_engine = SmartDecisionEngine()
-    reasoner = SemanticReasoner(cfg)
+    arbitrator      = ArbitrationCore(cfg)
+    reasoner        = SemanticReasoner(cfg)
     logger.info(f"VLM available: {reasoner.vlm.available}")
 
     stats = {
@@ -964,6 +966,14 @@ def main():
         vlm_output = reasoner.update(image, world_state, pred_state)
         if vlm_output and vlm_output.actor_intents:
             predictor.update_vlm_intents(vlm_output.actor_intents)
+
+        # Layer 5 — Arbitration Core (fuses all signals, produces audit trail)
+        if vlm_output and hasattr(vlm_output, "json_output") and vlm_output.json_output:
+            arbitrator.update_vlm(vlm_output.json_output)
+        arb_decision = arbitrator.arbitrate(
+            world_state, pred_state, scene, timestamp=world_state.timestamp
+        )
+        logger.debug(arb_decision.short_reason)
 
         elapsed = (time.time() - t0) * 1000
         stats["frames"] += 1
