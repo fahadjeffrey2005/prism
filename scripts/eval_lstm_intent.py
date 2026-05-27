@@ -239,17 +239,38 @@ def run_scene(
                 for line in lines:
                     print(f"    {line}")
 
-                # TTC estimate — simple: pedestrian within 5m crossing = high risk
-                is_risky = False
-                if cls == "pedestrian" and dist_m < 6.0 and "crossing" in top_label:
-                    ttc_est = dist_m / max(speed, 0.5)
-                    is_risky = True
+                # ── Risk assessment ──────────────────────────────────────
+                is_risky   = False
+                risk_note  = ""
+                ttc_est    = None
+
+                # Pedestrian crossing within 15m
+                if cls in ("pedestrian", "bicycle") and dist_m < 15.0 and "crossing" in top_label:
+                    ttc_est   = dist_m / max(speed, 0.3)
+                    is_risky  = True
+                    risk_note = f"⚠️  {cls.upper()} CROSSING  dist={dist_m:.1f}m  TTC≈{ttc_est:.1f}s"
+
+                # Any actor braking or stopping very close ahead
+                elif dist_m < 10.0 and top_label in ("braking", "stopping") and cls != "pedestrian":
+                    ttc_est   = dist_m / max(speed, 0.5)
+                    is_risky  = True
+                    risk_note = f"⚠️  {cls.upper()} BRAKING CLOSE  dist={dist_m:.1f}m  TTC≈{ttc_est:.1f}s"
+
+                # Fast actor close range regardless of intent
+                elif dist_m < 8.0 and speed > 3.0:   # > 10.8 km/h within 8m
+                    ttc_est   = dist_m / speed
+                    is_risky  = True
+                    risk_note = f"⚠️  CLOSE + FAST  dist={dist_m:.1f}m  speed={speed*3.6:.1f}km/h  TTC≈{ttc_est:.1f}s"
+
+                # Braking / stopping actor at medium range — heads up
+                elif dist_m < 25.0 and top_label in ("braking", "stopping"):
+                    risk_note = f"👁  {cls} {top_label} ahead at {dist_m:.1f}m"
+
+                if is_risky:
                     scene_stats["risky_actors"] += 1
-                    print(f"    ⚠️  PEDESTRIAN CROSSING RISK  TTC≈{ttc_est:.1f}s")
-                elif dist_m < 4.0 and speed > 2.0:
-                    is_risky = True
-                    scene_stats["risky_actors"] += 1
-                    print(f"    ⚠️  CLOSE RANGE HIGH SPEED")
+                    print(f"    {risk_note}")
+                elif risk_note:
+                    print(f"    {risk_note}")
 
                 # Verification
                 if gt_label_idx is not None:
@@ -277,20 +298,29 @@ def run_scene(
 
         # ── Frame-level decision ──────────────────────────────
 
-        risky = [d for d in frame_decisions if d[3]]
+        risky    = [d for d in frame_decisions if d[3]]
+        monitor  = [d for d in frame_decisions
+                    if not d[3] and d[1] in ("braking", "stopping")]
+
+        # Closest actor distance for situational awareness
+        close_actors = sorted(
+            [(d[1], d[2]) for d in frame_decisions],
+            key=lambda x: x[1], reverse=True
+        )
+
         if risky:
             decision = "CAUTION"
             dec_sym  = "🔴"
-        elif any("braking" in d[1] or "stopping" in d[1] for d in frame_decisions):
+        elif monitor:
             decision = "MONITOR"
             dec_sym  = "🟡"
         else:
             decision = "CLEAR"
             dec_sym  = "🟢"
 
-        print(f"\n    {dec_sym} Frame decision: {decision}  "
-              f"({len(frame_decisions)} actors tracked, "
-              f"{len(risky)} risky)")
+        print(f"\n    {dec_sym} Frame decision: {decision}  │  "
+              f"{len(frame_decisions)} actors tracked  │  "
+              f"{len(risky)} risky  │  {len(monitor)} braking/stopping")
 
         sample_token = sample["next"]
         frame_idx   += 1
