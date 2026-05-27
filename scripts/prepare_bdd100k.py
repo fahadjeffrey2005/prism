@@ -58,7 +58,7 @@ from typing import List, Tuple, Dict, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from prism.predictive_engine.lstm_intent import (
-    MANEUVERS, SEQUENCE_LEN, _normalise_trajectory,
+    MANEUVERS, SEQUENCE_LEN, INPUT_DIM, _normalise_trajectory,
 )
 from prism.utils.common import get_logger
 
@@ -225,7 +225,7 @@ def extract_windows_from_track(
         future_pos = positions[start + SEQUENCE_LEN : start + SEQUENCE_LEN + FUTURE_LEN]
 
         feat  = _normalise_trajectory(input_pos)
-        if feat is None or feat.shape != (SEQUENCE_LEN, 6):
+        if feat is None or feat.shape != (SEQUENCE_LEN, INPUT_DIM):
             continue
 
         label = derive_label_bdd(future_pos)

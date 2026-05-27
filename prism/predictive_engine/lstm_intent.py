@@ -5,8 +5,11 @@ Replaces the single-frame Bayesian classifier in the Predictive Engine with
 a 2-layer LSTM trained on nuScenes trajectory data.
 
 Architecture:
-    Input  : 10-frame sliding window of (x, y, vx, vy, ax, ay)
-             normalized to actor's start position and initial heading
+    Input  : 10-frame sliding window of (x, y, vx, vy, ax, ay, spd_norm)
+             normalised to actor's start position and initial heading.
+             spd_norm = mean(||Δpos||) over the input window in frame units.
+             This disambiguates stopped actors from slow constant-velocity actors
+             whose (x,y,vx,vy,ax,ay) features are otherwise nearly identical.
     LSTM   : 2 layers, hidden_dim=64
     Output : 9-class maneuver probability distribution
 
@@ -33,7 +36,7 @@ logger = get_logger("LSTMIntent")
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEQUENCE_LEN = 10     # frames of history fed to LSTM (5s at 2Hz, ~1s at 12fps)
-INPUT_DIM    = 6      # (x, y, vx, vy, ax, ay) — normalised
+INPUT_DIM    = 7      # (x, y, vx, vy, ax, ay, spd_norm) — normalised + mean speed
 HIDDEN_DIM   = 64
 NUM_LAYERS   = 2
 NUM_CLASSES  = 9      # same ordering as MANEUVERS in engine.py
@@ -155,38 +158,56 @@ class TrajectoryBuffer:
 
 def _normalise_trajectory(pos: np.ndarray) -> np.ndarray:
     """
-    Normalise a (T, 2) position sequence → (T, 6) feature tensor.
+    Normalise a (T, 2) position sequence → (T, 7) feature tensor.
+
+    Features: (x, y, vx, vy, ax, ay, spd_norm)
+        x, y        — position relative to first frame, rotated so net disp → +y
+        vx, vy      — central-difference velocity
+        ax, ay      — central-difference acceleration
+        spd_norm    — mean(||frame-to-frame displacement||) computed from the
+                      ORIGINAL positions BEFORE rotation/translation.  This is
+                      scale-preserved (rotation and translation don't change
+                      inter-frame distances) and disambiguates stopped actors
+                      (spd_norm ≈ 0) from slow constant-velocity actors whose
+                      kinematic features are otherwise indistinguishable.
     """
-    # Translate so first frame is at origin
+    # ── Feature 7: mean frame-to-frame speed (computed before any transform) ──
+    # Use raw inter-frame distances so the value is in the original metric units
+    # and invariant to the rotation we apply below.
+    frame_disp = np.linalg.norm(np.diff(pos, axis=0), axis=1)   # (T-1,)
+    mean_spd   = float(frame_disp.mean()) if len(frame_disp) > 0 else 0.0
+
+    # ── Translate so first frame is at origin ──────────────────────────────────
     pos = pos - pos[0]
 
-    # Rotate so the net displacement is along +y.
+    # ── Rotate so net displacement → +y ───────────────────────────────────────
     # angle = clockwise angle of disp from +y axis.
-    # To bring disp onto +y we rotate COUNTER-CLOCKWISE by +angle → R(+angle).
-    # R(+angle) = [[cos, -sin], [sin, cos]]
-    # BUG-FIX: was R(-angle) which flipped left/right, causing 100% lane_change
-    # direction confusion. Verified: R(+π/2) @ [1,0] = [0,1] ✓
+    # R(+angle) brings disp onto +y.  R(+angle) = [[cos,-sin],[sin,cos]].
+    # BUG-FIX (prev): was R(-angle) which flipped left/right.
     disp = pos[-1] - pos[0]
     dist = np.linalg.norm(disp)
     if dist > 0.05:
-        angle = np.arctan2(disp[0], disp[1])   # clockwise angle from +y axis
-        c, s  = np.cos(angle), np.sin(angle)   # +angle (was: -angle — wrong sign)
+        angle = np.arctan2(disp[0], disp[1])   # clockwise angle from +y
+        c, s  = np.cos(angle), np.sin(angle)
         R     = np.array([[c, -s], [s, c]], dtype=np.float32)
         pos   = (R @ pos.T).T                   # (T, 2)
 
-    # Velocity: central differences (pad endpoints with edge difference)
+    # ── Velocity: central differences (pad endpoints) ─────────────────────────
     vel = np.zeros_like(pos)
     vel[1:-1] = (pos[2:] - pos[:-2]) / 2.0
     vel[0]    = pos[1]  - pos[0]
     vel[-1]   = pos[-1] - pos[-2]
 
-    # Acceleration: first difference of velocity
+    # ── Acceleration: first difference of velocity ────────────────────────────
     acc = np.zeros_like(vel)
     acc[1:-1] = (vel[2:] - vel[:-2]) / 2.0
     acc[0]    = vel[1]  - vel[0]
     acc[-1]   = vel[-1] - vel[-2]
 
-    return np.concatenate([pos, vel, acc], axis=1).astype(np.float32)  # (T, 6)
+    # ── Append spd_norm as constant feature at every timestep ─────────────────
+    spd_feat = np.full((len(pos), 1), mean_spd, dtype=np.float32)   # (T, 1)
+
+    return np.concatenate([pos, vel, acc, spd_feat], axis=1).astype(np.float32)  # (T, 7)
 
 
 # ── Per-actor inference wrapper ───────────────────────────────────────────────

@@ -308,7 +308,7 @@ class TrajectoryDataset(Dataset):
                 bdd_feats  = data["features"]   # (N, T, 6)
                 bdd_labels = data["labels"]      # (N,)
                 for feat, label in zip(bdd_feats, bdd_labels):
-                    if feat.shape == (SEQUENCE_LEN, 6):
+                    if feat.shape == (SEQUENCE_LEN, INPUT_DIM):
                         self.samples.append((feat.astype(np.float32), int(label)))
                         bdd_count += 1
                         # Light augmentation on BDD too
