@@ -766,38 +766,49 @@ def run_vlm_efficiency_benchmark(cfg: dict, scene_indices: List[int], max_frames
             frame_idx += 1
 
     trigger_rate    = vlm_triggers / max(total_frames, 1)
-    frames_skipped  = 1.0 - trigger_rate
-    # Fixed-rate baseline: VLM every N frames at camera_fps
-    fixed_rate_1hz  = 1.0 / camera_fps       # every frame
-    fixed_rate_2hz  = 2.0 / camera_fps       # every other frame
-    saving_vs_1fps  = 1.0 - trigger_rate / max(fixed_rate_1hz, 1e-6)
+    frames_skipped = 1.0 - trigger_rate
 
-    # Hypothetical latency saved (assuming ~800ms VLM inference)
-    assumed_vlm_ms  = 800.0
-    saved_ms_per_frame = (fixed_rate_1hz - trigger_rate) * assumed_vlm_ms
+    # Correct baselines:
+    #   every-frame (100%)   — naive: VLM runs on every sample-frame
+    #   fixed-1Hz            — moderate: one VLM call per second
+    #   fixed-0.5Hz          — conservative: one call every 2 seconds
+    # Our event-driven rate is compared to each.
+    assumed_vlm_ms     = 800.0   # Qwen2.5-VL-7B on Jetson AGX Thor
+    saving_vs_every    = 1.0 - trigger_rate          # vs every-frame baseline
+    # At nuScenes 2Hz annotation rate, 1Hz = every 2 samples = 50% rate
+    fixed_1hz_rate     = min(1.0, 1.0 / max(camera_fps / 12.0, 0.5))
+    saving_vs_1hz      = max(0.0, 1.0 - trigger_rate / max(fixed_1hz_rate, 1e-6))
+    saved_ms_vs_every  = saving_vs_every  * assumed_vlm_ms
+    saved_ms_vs_1hz    = (fixed_1hz_rate - trigger_rate) * assumed_vlm_ms
 
-    print(f"  {'Metric':<40} {'Value':>12}")
-    print(f"  {hline(55)}")
-    print(f"  {'Total frames':<40} {total_frames:>12d}")
-    print(f"  {'VLM trigger count':<40} {vlm_triggers:>12d}")
-    print(f"  {'Trigger rate':<40} {trigger_rate*100:>11.1f}%")
-    print(f"  {'Frames skipped (no VLM call)':<40} {frames_skipped*100:>11.1f}%")
-    print(f"  {'Divergence events':<40} {divergence_events:>12d}")
-    print(f"  {'Silence events (forced)':<40} {silence_events:>12d}")
-    print(f"  {'Cooldown skips':<40} {cooldown_skips:>12d}")
-    print(f"  {'Baseline: VLM every frame (1× fps)':<40} {fixed_rate_1hz*100:>11.1f}%")
-    print(f"  {'Latency saved vs 1×fps baseline':<40} {saving_vs_1fps*100:>11.1f}%")
-    print(f"  {'Est. saved time (800ms VLM, /frame)':<40} {saved_ms_per_frame:>10.1f}ms")
+    print(f"  {'Metric':<44} {'Value':>10}")
+    print(f"  {hline(57)}")
+    print(f"  {'Total frames (sample-level)':<44} {total_frames:>10d}")
+    print(f"  {'VLM trigger count':<44} {vlm_triggers:>10d}")
+    print(f"  {'Event-driven trigger rate':<44} {trigger_rate*100:>9.1f}%")
+    print(f"  {'Frames skipped (VLM not called)':<44} {frames_skipped*100:>9.1f}%")
+    print(f"  {'  of which: divergence events':<44} {divergence_events:>10d}")
+    print(f"  {'  of which: silence (max gap) events':<44} {silence_events:>10d}")
+    print(f"  {'  of which: cooldown skips':<44} {cooldown_skips:>10d}")
+    print()
+    print(f"  {'Baseline A — VLM every frame (100%)':<44} {'100.0%':>10}")
+    print(f"  {'Savings vs baseline A':<44} {saving_vs_every*100:>9.1f}%")
+    print(f"  {'Est. latency saved vs A (per frame)':<44} {saved_ms_vs_every:>8.1f}ms")
+    print()
+    print(f"  {'Baseline B — VLM at fixed 1Hz':<44} {fixed_1hz_rate*100:>9.1f}%")
+    print(f"  {'Savings vs baseline B':<44} {saving_vs_1hz*100:>9.1f}%")
+    print(f"  {'Est. latency saved vs B (per frame)':<44} {max(saved_ms_vs_1hz,0):>8.1f}ms")
 
     return {
-        "total_frames":        total_frames,
-        "vlm_triggers":        vlm_triggers,
-        "trigger_rate":        trigger_rate,
-        "frames_skipped_pct":  frames_skipped,
-        "divergence_events":   divergence_events,
-        "silence_events":      silence_events,
-        "cooldown_skips":      cooldown_skips,
-        "saving_vs_1fps_pct":  saving_vs_1fps,
+        "total_frames":           total_frames,
+        "vlm_triggers":           vlm_triggers,
+        "trigger_rate":           trigger_rate,
+        "frames_skipped_pct":     frames_skipped,
+        "divergence_events":      divergence_events,
+        "silence_events":         silence_events,
+        "cooldown_skips":         cooldown_skips,
+        "saving_vs_every_frame":  saving_vs_every,
+        "saving_vs_1hz_fixed":    saving_vs_1hz,
     }
 
 
