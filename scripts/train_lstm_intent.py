@@ -209,10 +209,9 @@ def derive_label(future_pos: np.ndarray) -> int:
         return MANEUVERS.index("reversing")
 
     # Stopping: final speed near zero.
-    # Threshold raised to 3.0 m/s so hard-braking-to-stop (mean≈2.5 m/s)
-    # is captured. Was 1.0 m/s — too tight, caused braking-to-stop to fall
-    # through to constant_velocity.
-    if final_speed < 0.3 and mean_speed < 3.0:
+    # mean_speed < 1.5 — captures slow-crawl-to-stop without pulling in
+    # hard-braking events (those are caught by the braking check below).
+    if final_speed < 0.3 and mean_speed < 1.5:
         return MANEUVERS.index("stopping")
 
     # Strong deceleration
@@ -366,60 +365,6 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
-# ── Confusion-penalty loss ────────────────────────────────────────────────────
-
-class ConfusionPenaltyCELoss(nn.Module):
-    """
-    Cross-entropy with label smoothing + explicit confusion penalties.
-
-    For each (gt, wrong_pred) pair, when gt is the true class and the model
-    assigns high probability to wrong_pred, the loss is multiplied by
-    penalty_multiplier. This directly discourages the known confusion pairs:
-        stopping → reversing  (×3)
-        lane_change_left ↔ lane_change_right (×3)
-
-    Label smoothing 0.05 prevents overconfidence on dominant classes
-    (constant_velocity dominated Phase 1 training at 36.7%).
-    """
-
-    def __init__(
-        self,
-        weight:          Optional[torch.Tensor] = None,
-        label_smoothing: float = 0.05,
-        penalty_pairs:   list  = None,
-        device:          str   = "cpu",
-    ):
-        super().__init__()
-        self.weight          = weight
-        self.label_smoothing = label_smoothing
-        self.penalty_pairs   = penalty_pairs or []
-        self.n_classes       = len(MANEUVERS)
-
-        # Build penalty matrix: penalty_mat[gt, wrong] = extra_multiplier
-        pm = torch.ones(self.n_classes, self.n_classes, device=device)
-        for gt, wrong, mult in self.penalty_pairs:
-            pm[gt, wrong] = mult
-        self.register_buffer = None   # no buffers needed
-        self.penalty_mat = pm
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Standard cross-entropy with label smoothing
-        base_loss = nn.functional.cross_entropy(
-            logits, targets,
-            weight          = self.weight,
-            label_smoothing = self.label_smoothing,
-            reduction       = "none",
-        )   # (B,)
-
-        # Confusion penalty: for each sample, scale loss by the penalty
-        # associated with (true_class, predicted_class)
-        with torch.no_grad():
-            preds    = logits.argmax(dim=-1)         # (B,)
-            penalties = self.penalty_mat[targets, preds]  # (B,)
-
-        return (base_loss * penalties).mean()
-
-
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
@@ -479,22 +424,11 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
 
-    # Loss — class-weighted cross entropy with label smoothing.
-    # Label smoothing 0.05 reduces overconfidence on dominant classes.
-    # confusion_penalty extra-penalises stopping→reversing and
-    # lane_change_left↔right swaps (the two confirmed confusion pairs).
+    # Loss — class-weighted cross entropy (proven stable at 78% Phase 1).
+    # ConfusionPenaltyCELoss was removed: register_buffer override corrupted
+    # nn.Module and label_smoothing+weight interaction caused gradient collapse.
     class_w   = train_ds.class_weights().to(device)
-    criterion = ConfusionPenaltyCELoss(
-        weight          = class_w,
-        label_smoothing = 0.05,
-        penalty_pairs   = [
-            # (gt_class, wrong_pred_class, extra_penalty_multiplier)
-            (MANEUVERS.index("stopping"),         MANEUVERS.index("reversing"),        3.0),
-            (MANEUVERS.index("lane_change_left"),  MANEUVERS.index("lane_change_right"),3.0),
-            (MANEUVERS.index("lane_change_right"), MANEUVERS.index("lane_change_left"), 3.0),
-        ],
-        device = device,
-    )
+    criterion = nn.CrossEntropyLoss(weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
