@@ -6,10 +6,11 @@ a 2-layer LSTM trained on nuScenes trajectory data.
 
 Architecture:
     Input  : 10-frame sliding window of (x, y, vx, vy, ax, ay, spd_norm)
-             normalised to actor's start position and initial heading.
+             normalised to actor's start position with initial heading → +y.
              spd_norm = mean(||Δpos||) over the input window in frame units.
-             This disambiguates stopped actors from slow constant-velocity actors
-             whose (x,y,vx,vy,ax,ay) features are otherwise nearly identical.
+             Initial-heading normalisation ensures all left turns curve toward
+             -x and all right turns curve toward +x, giving the LSTM a
+             consistent learnable pattern regardless of observation window.
     LSTM   : 2 layers, hidden_dim=64
     Output : 9-class maneuver probability distribution
 
@@ -161,36 +162,50 @@ def _normalise_trajectory(pos: np.ndarray) -> np.ndarray:
     Normalise a (T, 2) position sequence → (T, 7) feature tensor.
 
     Features: (x, y, vx, vy, ax, ay, spd_norm)
-        x, y        — position relative to first frame, rotated so net disp → +y
-        vx, vy      — central-difference velocity
-        ax, ay      — central-difference acceleration
-        spd_norm    — mean(||frame-to-frame displacement||) computed from the
-                      ORIGINAL positions BEFORE rotation/translation.  This is
-                      scale-preserved (rotation and translation don't change
-                      inter-frame distances) and disambiguates stopped actors
-                      (spd_norm ≈ 0) from slow constant-velocity actors whose
-                      kinematic features are otherwise indistinguishable.
+        x, y     — position relative to first frame, rotated so the actor's
+                   INITIAL HEADING is along +y (not net displacement).
+                   Key advantage: every left turn appears as a curve from +y
+                   toward negative-x regardless of where in the turn window
+                   the observation starts.  Using net displacement (previous
+                   approach) made early-turn windows look completely different
+                   from mid-turn windows, preventing the LSTM from learning a
+                   consistent "this is a turn" pattern.
+        vx, vy   — central-difference velocity
+        ax, ay   — central-difference acceleration
+        spd_norm — mean(||frame-to-frame displacement||) — disambiguates
+                   stopped actors (≈0) from slow constant-velocity actors.
     """
-    # ── Feature 7: mean frame-to-frame speed (computed before any transform) ──
-    # Use raw inter-frame distances so the value is in the original metric units
-    # and invariant to the rotation we apply below.
+    # ── Feature 7: raw mean speed (before any transform) ──────────────────────
     frame_disp = np.linalg.norm(np.diff(pos, axis=0), axis=1)   # (T-1,)
     mean_spd   = float(frame_disp.mean()) if len(frame_disp) > 0 else 0.0
 
-    # ── Translate so first frame is at origin ──────────────────────────────────
+    # ── Translate so first frame is at origin ─────────────────────────────────
     pos = pos - pos[0]
 
-    # ── Rotate so net displacement → +y ───────────────────────────────────────
-    # angle = clockwise angle of disp from +y axis.
-    # R(+angle) brings disp onto +y.  R(+angle) = [[cos,-sin],[sin,cos]].
-    # BUG-FIX (prev): was R(-angle) which flipped left/right.
-    disp = pos[-1] - pos[0]
-    dist = np.linalg.norm(disp)
-    if dist > 0.05:
-        angle = np.arctan2(disp[0], disp[1])   # clockwise angle from +y
+    # ── Rotate so INITIAL HEADING → +y ────────────────────────────────────────
+    # Find the first frame-to-frame step with meaningful motion.
+    # This is the actor's initial heading direction.
+    raw_steps = pos[1:] - pos[:-1]          # (T-1, 2)
+    fwd_dir   = None
+    for step in raw_steps:
+        step_dist = np.linalg.norm(step)
+        if step_dist > 0.02:                 # > 2cm/frame = > 4cm/s at 2Hz
+            fwd_dir = step / step_dist
+            break
+
+    # Stationary actors: fall back to net displacement (same as before)
+    if fwd_dir is None:
+        net = pos[-1]
+        net_d = np.linalg.norm(net)
+        if net_d > 0.02:
+            fwd_dir = net / net_d
+
+    if fwd_dir is not None:
+        # Clockwise angle from +y to fwd_dir; R(angle) maps fwd_dir → +y
+        angle = np.arctan2(fwd_dir[0], fwd_dir[1])
         c, s  = np.cos(angle), np.sin(angle)
         R     = np.array([[c, -s], [s, c]], dtype=np.float32)
-        pos   = (R @ pos.T).T                   # (T, 2)
+        pos   = (R @ pos.T).T
 
     # ── Velocity: central differences (pad endpoints) ─────────────────────────
     vel = np.zeros_like(pos)
@@ -204,8 +219,8 @@ def _normalise_trajectory(pos: np.ndarray) -> np.ndarray:
     acc[0]    = vel[1]  - vel[0]
     acc[-1]   = vel[-1] - vel[-2]
 
-    # ── Append spd_norm as constant feature at every timestep ─────────────────
-    spd_feat = np.full((len(pos), 1), mean_spd, dtype=np.float32)   # (T, 1)
+    # ── Mean speed as constant feature at every timestep ──────────────────────
+    spd_feat = np.full((len(pos), 1), mean_spd, dtype=np.float32)
 
     return np.concatenate([pos, vel, acc, spd_feat], axis=1).astype(np.float32)  # (T, 7)
 
