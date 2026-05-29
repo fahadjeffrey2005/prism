@@ -18,6 +18,9 @@ prism_data/
 *.tgz
 *.zip
 
+# CARLA server binary — installed locally, not committed
+carla_server/
+
 # HuggingFace cache
 hf_cache/
 

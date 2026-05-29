@@ -10,7 +10,7 @@
 set -e
 
 CARLA_VERSION="0.9.15"
-CARLA_DIR="$HOME/carla"
+CARLA_DIR="$(cd "$(dirname "$0")/.." && pwd)/carla_server"
 CARLA_URL="https://github.com/carla-simulator/carla/releases/download/${CARLA_VERSION}/CARLA_${CARLA_VERSION}.tar.gz"
 ADDMAPS_URL="https://github.com/carla-simulator/carla/releases/download/${CARLA_VERSION}/AdditionalMaps_${CARLA_VERSION}.tar.gz"
 
@@ -68,10 +68,10 @@ echo "============================================================"
 echo "CARLA setup complete."
 echo ""
 echo "To start CARLA server (headless, no display needed):"
-echo "  ${CARLA_DIR}/CarlaUE4.sh -RenderOffScreen"
+echo "  ~/prism/carla_server/CarlaUE4.sh -RenderOffScreen"
 echo ""
 echo "Or with display:"
-echo "  ${CARLA_DIR}/CarlaUE4.sh"
+echo "  ~/prism/carla_server/CarlaUE4.sh"
 echo ""
 echo "Once server is running, in a new terminal:"
 echo "  cd ~/prism && python3 scripts/run_carla_eval.py"
