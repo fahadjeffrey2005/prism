@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRISM — Live Dashboard</title>
+<style>
+:root {
+  --bg:       #101010;
+  --sb:       #161614;
+  --card:     #1c1c1a;
+  --border:   rgba(255,255,255,0.09);
+  --text:     #e2e2de;
+  --muted:    #7a7a76;
+  --accent:   #9fd4bc;
+  --accent2:  #1d9e75;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; }
+body { display: flex; }
+
+/* ── Sidebar ── */
+#sidebar {
+  width: 228px; min-width: 228px;
+  background: var(--sb);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden;
+}
+.sb-logo { padding: 14px 16px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.sb-logo-title { font-size: 17px; font-weight: 700; letter-spacing: -0.4px; }
+.sb-logo-title span { color: var(--accent); }
+.sb-logo-sub { font-size: 10px; color: var(--muted); margin-top: 1px; }
+
+.sb-section { padding: 11px 14px; border-bottom: 1px solid var(--border); }
+.sb-sec-hd { font-size: 9.5px; font-weight: 600; letter-spacing: 0.7px; text-transform: uppercase; color: var(--muted); margin-bottom: 9px; }
+
+.conn-status { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; font-size: 12px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dot.off  { background: #555; }
+.dot.wait { background: #ba7517; animation: blink 1s ease infinite; }
+.dot.on   { background: var(--accent2); }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+
+.sb-input {
+  width: 100%; background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 11.5px; padding: 6px 9px;
+  margin-bottom: 7px;
+}
+.sb-input:focus { outline: none; border-color: var(--accent); }
+.sb-btn {
+  width: 100%; background: rgba(159,212,188,0.1);
+  border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--accent); font-size: 12px; padding: 6px;
+  cursor: pointer; transition: background .15s;
+}
+.sb-btn:hover { background: rgba(159,212,188,.2); }
+.sb-btn.disc  { background: rgba(226,75,74,.1); border-color: #e24b4a; color: #e24b4a; }
+.sb-btn.disc:hover { background: rgba(226,75,74,.2); }
+.sb-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.sb-label { font-size: 10.5px; color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 4px; }
+.sb-select {
+  width: 100%; background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 11.5px; padding: 6px 8px;
+  margin-bottom: 9px;
+}
+.sb-select:focus { outline: none; border-color: var(--accent); }
+.sb-select:disabled { opacity: .4; }
+
+.toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; font-size: 12px; }
+.tog { position: relative; width: 34px; height: 18px; }
+.tog input { opacity: 0; width: 0; height: 0; position: absolute; }
+.tog-track { position: absolute; inset: 0; background: rgba(255,255,255,.1); border-radius: 9px; cursor: pointer; transition: background .2s; }
+.tog input:checked + .tog-track { background: var(--accent2); }
+.tog-thumb { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: #fff; border-radius: 50%; pointer-events: none; transition: transform .2s; }
+.tog input:checked ~ .tog-thumb { transform: translateX(16px); }
+
+.sb-range-row { margin-bottom: 4px; }
+input[type=range] { width: 100%; accent-color: var(--accent2); cursor: pointer; margin: 3px 0; }
+
+.pause-btn {
+  width: 100%; background: rgba(255,255,255,.07);
+  border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 6px;
+  cursor: pointer; margin-top: 2px;
+}
+.pause-btn:hover { background: rgba(255,255,255,.12); }
+.pause-btn:disabled { opacity: .4; }
+
+.sb-row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; }
+.sb-k { color: var(--muted); }
+.sb-v { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; text-align: right; }
+
+.hist-strip { display: flex; gap: 2px; margin-top: 6px; overflow: hidden; }
+.hist-b { width: 9px; height: 14px; border-radius: 2px; flex-shrink: 0; }
+
+.sb-footer { padding: 10px 14px; font-size: 10px; color: var(--muted); margin-top: auto; }
+
+/* ── Main ── */
+#main {
+  flex: 1; display: flex; flex-direction: column;
+  padding: 8px; gap: 8px; overflow: hidden; min-width: 0;
+}
+
+/* ── Video row ── */
+.video-row { display: flex; gap: 8px; flex: 1; min-height: 0; }
+.v-panel {
+  flex: 1; background: #000; border-radius: 9px;
+  border: 1px solid var(--border); position: relative; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  min-width: 0;
+}
+.v-panel img { width: 100%; height: 100%; object-fit: contain; display: none; }
+.v-label {
+  position: absolute; top: 7px; left: 9px;
+  font-size: 9.5px; font-weight: 600; letter-spacing: .9px;
+  text-transform: uppercase; color: rgba(255,255,255,.4); z-index: 2; pointer-events: none;
+}
+.v-badge {
+  position: absolute; top: 7px; right: 9px; z-index: 2;
+  font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 4px;
+  display: none;
+}
+
+/* Loading overlay */
+.v-overlay {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px;
+  background: rgba(0,0,0,.7); border-radius: 9px;
+}
+.spinner { width: 26px; height: 26px; border: 2px solid rgba(159,212,188,.2); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.overlay-msg { font-size: 11px; color: var(--muted); text-align: center; padding: 0 20px; }
+
+/* VLM flash ring */
+.vlm-ring {
+  position: absolute; inset: 0; border-radius: 9px; pointer-events: none;
+  border: 2px solid transparent; transition: border-color .2s;
+}
+.vlm-ring.active { border-color: rgba(159,212,188,.5); }
+
+/* ── Metrics row ── */
+.metrics-row { height: 148px; display: flex; gap: 8px; flex-shrink: 0; }
+
+.stat-grid { flex: 3; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.stat-card {
+  background: var(--card); border-radius: 8px; border: 1px solid var(--border);
+  padding: 10px 12px; display: flex; flex-direction: column; justify-content: space-between;
+}
+.stat-lbl { font-size: 9.5px; color: var(--muted); letter-spacing: .2px; }
+.stat-val { font-size: 21px; font-weight: 700; letter-spacing: -.5px; line-height: 1.1; }
+.stat-sub { font-size: 9.5px; color: var(--muted); }
+.stat-unit { font-size: 11px; font-weight: 400; color: var(--muted); }
+
+.dec-panel {
+  flex: 2; background: var(--card); border-radius: 8px;
+  border: 1px solid var(--border); padding: 10px 12px; overflow: hidden;
+}
+.dec-hd { font-size: 9.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 7px; }
+.d-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.d-lbl { font-size: 9.5px; color: var(--muted); width: 70px; text-align: right; flex-shrink: 0; }
+.d-bg  { flex: 1; background: rgba(255,255,255,.07); border-radius: 3px; height: 11px; overflow: hidden; }
+.d-bar { height: 100%; border-radius: 3px; transition: width .5s ease; }
+.d-pct { font-size: 9.5px; font-weight: 600; width: 26px; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar ── -->
+<div id="sidebar">
+  <div class="sb-logo">
+    <div class="sb-logo-title">PRISM <span>live</span></div>
+    <div class="sb-logo-sub">Real-time evaluation dashboard</div>
+  </div>
+
+  <!-- Connection -->
+  <div class="sb-section">
+    <div class="sb-sec-hd">Connection</div>
+    <div class="conn-status">
+      <span class="dot off" id="dot"></span>
+      <span id="conn-text">Disconnected</span>
+    </div>
+    <input class="sb-input" id="ws-url" value="ws://localhost:8765" spellcheck="false">
+    <button class="sb-btn" id="conn-btn" onclick="toggleConn()">Connect</button>
+  </div>
+
+  <!-- Scene + controls -->
+  <div class="sb-section">
+    <div class="sb-sec-hd">Scene &amp; controls</div>
+
+    <label class="sb-label">Active scene</label>
+    <select class="sb-select" id="scene-sel" disabled onchange="sendCmd({cmd:'set_scene',scene_idx:+this.value})">
+      <option>— not connected —</option>
+    </select>
+
+    <div class="toggle-row">
+      <span>VLM enabled</span>
+      <label class="tog">
+        <input type="checkbox" id="vlm-tog" checked onchange="sendCmd({cmd:'set_vlm',enabled:this.checked})">
+        <span class="tog-track"></span><span class="tog-thumb"></span>
+      </label>
+    </div>
+
+    <div class="sb-range-row">
+      <label class="sb-label">Replay speed <span id="spd-lbl" style="color:var(--accent)">1.0×</span></label>
+      <input type="range" min=".25" max="4" step=".25" value="1" id="spd-range"
+             oninput="document.getElementById('spd-lbl').textContent=parseFloat(this.value).toFixed(2)+'×'; sendCmd({cmd:'set_speed',multiplier:+this.value})">
+    </div>
+
+    <button class="pause-btn" id="pause-btn" disabled onclick="togglePause()">⏸  Pause</button>
+  </div>
+
+  <!-- Live stats -->
+  <div class="sb-section" style="flex:1">
+    <div class="sb-sec-hd">Live stats</div>
+    <div class="sb-row"><span class="sb-k">Frames processed</span><span class="sb-v" id="s-frames">—</span></div>
+    <div class="sb-row"><span class="sb-k">Decision</span><span class="sb-v" id="s-dec">—</span></div>
+    <div class="sb-row"><span class="sb-k">Risk score</span><span class="sb-v" id="s-risk">—</span></div>
+    <div class="sb-row"><span class="sb-k">Actors</span><span class="sb-v" id="s-actors">—</span></div>
+    <div class="sb-row"><span class="sb-k">Avg latency</span><span class="sb-v" id="s-lat">—</span></div>
+    <div class="sb-row"><span class="sb-k">VLM rate</span><span class="sb-v" id="s-vlm">—</span></div>
+    <div class="sb-row"><span class="sb-k">Scene</span><span class="sb-v" id="s-scene">—</span></div>
+
+    <label class="sb-label" style="margin-top:10px;margin-bottom:3px;">Decision history</label>
+    <div class="hist-strip" id="hist"></div>
+  </div>
+
+  <div class="sb-footer">PRISM · nuScenes closed-loop eval</div>
+</div>
+
+<!-- ── Main content ── -->
+<div id="main">
+
+  <!-- Video panels -->
+  <div class="video-row">
+    <div class="v-panel" id="in-panel">
+      <div class="v-label">Input feed</div>
+      <div class="v-overlay" id="in-ov">
+        <div class="spinner"></div>
+        <div class="overlay-msg" id="ov-msg">Connect to start stream</div>
+      </div>
+      <img id="in-img" alt="Input camera feed">
+    </div>
+    <div class="v-panel" id="out-panel">
+      <div class="v-label">PRISM output</div>
+      <div class="v-badge" id="vlm-badge" style="background:rgba(29,158,117,.25);color:#9fd4bc;border:1px solid rgba(159,212,188,.3)">● VLM active</div>
+      <div class="v-overlay" id="out-ov">
+        <div class="overlay-msg">Waiting for stream...</div>
+      </div>
+      <img id="out-img" alt="PRISM annotated output">
+      <div class="vlm-ring" id="vlm-ring"></div>
+    </div>
+  </div>
+
+  <!-- Metrics -->
+  <div class="metrics-row">
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-lbl">Decision</div>
+        <div class="stat-val" id="m-dec" style="font-size:17px;color:var(--muted)">—</div>
+        <div class="stat-sub" id="m-dec-sub">waiting</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-lbl">Risk score</div>
+        <div class="stat-val" id="m-risk" style="color:var(--muted)">—</div>
+        <div class="stat-sub" id="m-risk-sub">0–1 scale</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-lbl">Actors detected</div>
+        <div class="stat-val" id="m-actors" style="color:var(--muted)">—</div>
+        <div class="stat-sub">this frame</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-lbl">Pipeline latency</div>
+        <div class="stat-val" id="m-lat" style="color:var(--muted)">—<span class="stat-unit"> ms</span></div>
+        <div class="stat-sub" id="m-lat-sub">avg —ms</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-lbl">VLM trigger rate</div>
+        <div class="stat-val" id="m-vlm" style="color:var(--muted)">—<span class="stat-unit"> %</span></div>
+        <div class="stat-sub" id="m-vlm-sub">of frames</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-lbl">Frame</div>
+        <div class="stat-val" id="m-frame" style="font-size:17px;color:var(--muted)">—</div>
+        <div class="stat-sub" id="m-frame-sub">of scene</div>
+      </div>
+    </div>
+
+    <div class="dec-panel">
+      <div class="dec-hd">Decision distribution</div>
+      <div id="d-bars">
+        <div style="font-size:11px;color:var(--muted);margin-top:14px;text-align:center;">Waiting for data...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DEC_COLOR = {
+  CLEAR:'#1d9e75', MONITOR:'#185fa5', EASE:'#1d9e75',
+  SLOW:'#888780',  CAUTION:'#ba7517', YIELD:'#ef9f27',
+  STOP:'#993c1d',  EMERGENCY:'#e24b4a'
+};
+const D_ORDER = ['EASE','CAUTION','MONITOR','SLOW','EMERGENCY','YIELD','STOP','CLEAR'];
+const MAX_HIST = 44;
+const hist = [];
+
+let ws = null, connected = false, paused = false;
+
+function setConn(state, text) {
+  const d = document.getElementById('dot');
+  d.className = 'dot ' + {on:'on', off:'off', wait:'wait'}[state];
+  document.getElementById('conn-text').textContent = text;
+}
+
+function sendCmd(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function toggleConn() {
+  if (connected) { ws && ws.close(); return; }
+  const url = document.getElementById('ws-url').value.trim();
+  const btn = document.getElementById('conn-btn');
+  setConn('wait', 'Connecting…');
+  btn.textContent = 'Connecting…'; btn.disabled = true;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    connected = true;
+    setConn('on', 'Connected');
+    btn.textContent = 'Disconnect'; btn.className = 'sb-btn disc'; btn.disabled = false;
+    document.getElementById('pause-btn').disabled = false;
+    document.getElementById('ov-msg').textContent = 'Loading PRISM pipeline…';
+  };
+  ws.onclose = () => {
+    connected = false;
+    setConn('off', 'Disconnected');
+    btn.textContent = 'Connect'; btn.className = 'sb-btn'; btn.disabled = false;
+    document.getElementById('pause-btn').disabled = true;
+    document.getElementById('scene-sel').disabled = true;
+  };
+  ws.onerror = () => {
+    setConn('off', 'Connection failed');
+    btn.textContent = 'Retry'; btn.disabled = false; connected = false;
+  };
+  ws.onmessage = e => {
+    try { dispatch(JSON.parse(e.data)); } catch(_) {}
+  };
+}
+
+function dispatch(msg) {
+  if      (msg.type === 'frame')  onFrame(msg);
+  else if (msg.type === 'status') onStatus(msg);
+  else if (msg.type === 'scenes') onScenes(msg);
+}
+
+function onStatus(msg) {
+  document.getElementById('ov-msg').textContent = msg.message || '';
+}
+
+function onScenes(msg) {
+  const sel = document.getElementById('scene-sel');
+  sel.innerHTML = '';
+  sel.disabled = false;
+  (msg.scenes || []).forEach(s => {
+    const o = document.createElement('option');
+    o.value = s.idx;
+    o.textContent = `${s.idx}: ${s.name}`;
+    sel.appendChild(o);
+  });
+}
+
+function onFrame(msg) {
+  // Show images
+  const inImg  = document.getElementById('in-img');
+  const outImg = document.getElementById('out-img');
+  if (msg.input)  { inImg.src  = 'data:image/jpeg;base64,' + msg.input;  inImg.style.display  = 'block'; document.getElementById('in-ov').style.display  = 'none'; }
+  if (msg.output) { outImg.src = 'data:image/jpeg;base64,' + msg.output; outImg.style.display = 'block'; document.getElementById('out-ov').style.display = 'none'; }
+
+  const dec = msg.decision || '---';
+  const dc  = DEC_COLOR[dec] || '#888';
+
+  // VLM active indicator
+  const vlmBadge = document.getElementById('vlm-badge');
+  const vlmRing  = document.getElementById('vlm-ring');
+  if (msg.vlm_active) {
+    vlmBadge.style.display = 'block';
+    vlmRing.classList.add('active');
+  } else {
+    vlmBadge.style.display = 'none';
+    vlmRing.classList.remove('active');
+  }
+
+  // Metric cards
+  const mDec = document.getElementById('m-dec');
+  mDec.textContent = dec; mDec.style.color = dc;
+  const riskLvlLabels = ['—', 'LOW', 'MEDIUM', 'HIGH'];
+  document.getElementById('m-dec-sub').textContent = `risk level ${msg.risk_level ?? '?'} · ${riskLvlLabels[msg.risk_level] || ''}`;
+
+  const r = typeof msg.risk_score === 'number' ? msg.risk_score : null;
+  const mRisk = document.getElementById('m-risk');
+  mRisk.textContent = r !== null ? r.toFixed(2) : '—';
+  mRisk.style.color = r === null ? '#888' : r > .6 ? '#e24b4a' : r > .35 ? '#ba7517' : '#1d9e75';
+  document.getElementById('m-risk-sub').textContent = r !== null ? (r > .6 ? 'HIGH risk' : r > .35 ? 'MEDIUM risk' : 'LOW risk') : '0–1 scale';
+
+  const mAct = document.getElementById('m-actors');
+  mAct.textContent = msg.actors ?? '—';
+  mAct.style.color = (msg.actors > 5) ? '#ba7517' : (msg.actors > 0) ? var_text() : '#888';
+
+  const mLat = document.getElementById('m-lat');
+  const lat  = msg.latency_ms ?? null;
+  mLat.innerHTML = (lat !== null ? Math.round(lat) : '—') + '<span class="stat-unit"> ms</span>';
+  mLat.style.color = lat === null ? '#888' : lat > 800 ? '#ba7517' : '#e2e2de';
+  document.getElementById('m-lat-sub').textContent = `avg ${msg.avg_latency_ms ?? '—'}ms`;
+
+  const mVlm = document.getElementById('m-vlm');
+  mVlm.innerHTML = (msg.vlm_rate_pct ?? '—') + '<span class="stat-unit"> %</span>';
+  mVlm.style.color = msg.vlm_active ? '#9fd4bc' : '#e2e2de';
+  document.getElementById('m-vlm-sub').textContent = msg.vlm_active ? '● VLM just fired' : 'of frames';
+
+  const mFrm = document.getElementById('m-frame');
+  mFrm.textContent = `${(msg.frame_idx ?? 0) + 1}`;
+  mFrm.style.color = '#e2e2de';
+  document.getElementById('m-frame-sub').textContent = `of ${msg.total_frames ?? '?'} frames`;
+
+  // Sidebar stats
+  document.getElementById('s-frames').textContent = msg.total_processed ?? '—';
+  const sDec = document.getElementById('s-dec');
+  sDec.textContent = dec; sDec.style.color = dc;
+  document.getElementById('s-risk').textContent   = r !== null ? r.toFixed(3) : '—';
+  document.getElementById('s-actors').textContent  = msg.actors ?? '—';
+  document.getElementById('s-lat').textContent     = (msg.avg_latency_ms ?? '—') + 'ms';
+  const sVlm = document.getElementById('s-vlm');
+  sVlm.textContent = (msg.vlm_rate_pct ?? '—') + '%' + (msg.vlm_active ? ' ●' : '');
+  sVlm.style.color = msg.vlm_active ? '#9fd4bc' : '#e2e2de';
+  document.getElementById('s-scene').textContent   = msg.scene ?? '—';
+
+  // Decision distribution bars
+  if (msg.decisions && Object.keys(msg.decisions).length > 0) {
+    const c = document.getElementById('d-bars');
+    c.innerHTML = '';
+    D_ORDER.forEach(k => {
+      const p = msg.decisions[k] || 0;
+      if (!p) return;
+      const row = document.createElement('div'); row.className = 'd-row';
+      row.innerHTML = `<span class="d-lbl">${k}</span><div class="d-bg"><div class="d-bar" style="width:${p}%;background:${DEC_COLOR[k]||'#888'}"></div></div><span class="d-pct" style="color:${DEC_COLOR[k]||'#888'}">${p}%</span>`;
+      c.appendChild(row);
+    });
+  }
+
+  // History strip
+  hist.push(dc);
+  if (hist.length > MAX_HIST) hist.shift();
+  document.getElementById('hist').innerHTML = hist.map(c => `<div class="hist-b" style="background:${c}"></div>`).join('');
+}
+
+function var_text() { return '#e2e2de'; }
+
+function togglePause() {
+  paused = !paused;
+  sendCmd({cmd: paused ? 'pause' : 'resume'});
+  document.getElementById('pause-btn').textContent = paused ? '▶  Resume' : '⏸  Pause';
+}
+</script>
+</body>
+</html>
