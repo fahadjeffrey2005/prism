@@ -1102,12 +1102,35 @@ def main():
     if video_writer is not None:
         video_writer.release()
         logger.info(f"Video saved: {output_dir}/prism_output.mp4")
+
+    # Wait for any in-flight VLM inference to complete before reporting stats.
+    # VLM takes ~5-30s under GPU contention — we give it up to 90s.
+    if reasoner.worker.is_busy:
+        logger.info("Waiting for in-flight VLM inference to complete (max 90s)...")
+        deadline = time.time() + 90
+        while reasoner.worker.is_busy and time.time() < deadline:
+            time.sleep(1.0)
+        if reasoner.worker.is_busy:
+            logger.warning("VLM inference still running after 90s — reporting partial stats")
+        else:
+            logger.info("VLM inference completed.")
+        # Drain any result that just landed
+        new_out = reasoner.worker.get_latest_output()
+        if new_out:
+            reasoner.latest_output = new_out
+
     vlm_stats = reasoner.stats
     logger.info(f"\nVLM Statistics:")
     logger.info(f"  Total calls:    {vlm_stats['vlm_calls']}")
+    logger.info(f"  Trigger count:  {vlm_stats['triggers']}")
     logger.info(f"  Trigger rate:   {vlm_stats['trigger_rate']*100:.1f}% of frames")
     logger.info(f"  Avg inference:  {vlm_stats['avg_inference_ms']:.0f}ms")
-    logger.info(f"  Efficiency:     {vlm_stats['efficiency']*100:.1f}% frames skipped")
+    logger.info(f"  Skipped frames: {vlm_stats['skipped']}")
+    if reasoner.latest_output:
+        lo = reasoner.latest_output
+        logger.info(f"  Last caption:   {lo.scene_summary[:80]}")
+        logger.info(f"  Last caution:   {lo.recommended_caution}")
+        logger.info(f"  Last flags:     {lo.risk_flags[:3]}")
     logger.info(f"\nOutput: {output_dir}")
     logger.info("=" * 60)
 
