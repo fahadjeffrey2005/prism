@@ -530,6 +530,7 @@ class AsyncVLMWorker:
             try:
                 job = self._job_queue.get(timeout=1.0)
                 t_start = time.time()
+                logger.info(f"VLM worker: picked up job trigger={job['trigger_reason']} (queued {(t_start - job['posted_at'])*1000:.0f}ms ago)")
 
                 response, inference_ms = self.model.infer(
                     job["image"], job["prompt"]
@@ -641,6 +642,7 @@ class SemanticReasoner:
         # Check trigger
         trigger_reason = self.monitor.check(pred_state, world_state)
         if trigger_reason:
+            logger.info(f"VLM trigger fired: {trigger_reason} (frame {self._frame_count})")
             prompt = self.prompt_builder.build(world_state, pred_state, trigger_reason)
             self.worker.post_job(
                 image=image,

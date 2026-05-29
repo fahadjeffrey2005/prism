@@ -55,7 +55,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="PRISM Full Pipeline")
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--scene", type=int, default=0)
-    parser.add_argument("--max-frames", type=int, default=40)
+    parser.add_argument("--max-frames", type=int, default=80)
     parser.add_argument("--save", action="store_true", default=True)
     parser.add_argument("--no-save", dest="save", action="store_false")
     parser.add_argument("--show", action="store_true")
