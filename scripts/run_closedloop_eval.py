@@ -241,7 +241,8 @@ def run_frame(pipeline: dict, image: np.ndarray, timestamp: float,
                                            timestamp=timestamp)
 
     latency_ms = (time.time() - t0) * 1000
-    return control, arb, scene, vlm_out, world_state, latency_ms
+    # Return metric_dets so evaluate_scene can use real distances (metres)
+    return control, arb, scene, vlm_out, world_state, metric_dets, latency_ms
 
 
 # ── Main evaluation ───────────────────────────────────────────────────────────
@@ -280,7 +281,7 @@ def evaluate_scene(scene_idx: int, pipeline: dict, loader, cfg: dict) -> dict:
         timestamp = frame_data["timestamp"]
         calib     = frame_data.get("calibration", calib)
 
-        control, arb, scene, vlm_out, world_state, lat = run_frame(
+        control, arb, scene, vlm_out, world_state, metric_dets, lat = run_frame(
             pipeline, image, timestamp, calib
         )
 
@@ -291,17 +292,20 @@ def evaluate_scene(scene_idx: int, pipeline: dict, loader, cfg: dict) -> dict:
             steer=control.control.steer,
         )
 
-        # Build actor list from world model
+        # Build actor list from metric detections — real world distances (metres)
+        # Positions are in ego/camera frame: lateral_m = x, distance_m = forward z
+        # We check from [0,0] (ego is always at origin of its own frame)
         actors = []
-        for actor in world_state.actors:
-            if actor.depth is not None:
-                d = float(actor.depth * 50.0)
+        for det in metric_dets:
+            if det.distance_m > 0:
                 actors.append({
-                    "pos": np.array([d * 0.1, d]),   # approximate x, z
-                    "vel": np.zeros(2),
+                    "pos": np.array([det.lateral_m, det.distance_m]),
+                    # Use ego forward speed as closing speed for TTC
+                    "vel": np.array([0.0, max(ego.speed, 0.5)]),
                 })
 
-        safety.check(ego.pos, actors, total_frames)
+        # Safety check in ego-centric frame (actors already relative to ego)
+        safety.check(np.array([0.0, 0.0]), actors, total_frames)
 
         decisions[arb.action] += 1
         if control.emergency:
