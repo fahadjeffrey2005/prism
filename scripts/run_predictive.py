@@ -31,6 +31,10 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import atexit, os
+# Suppress PyTorch CUDA destructor crash on Jetson at clean exit
+atexit.register(lambda: os._exit(0))
+
 from prism.utils.common import load_config, get_logger, CLASS_COLORS, ARBITRATION_COLORS
 from prism.sensory_core.core import SensoryCore
 from prism.sensory_core.data_loader import NuScenesLoader

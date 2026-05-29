@@ -352,13 +352,15 @@ class VLMModel:
                 messages, tokenize=False, add_generation_prompt=True
             )
 
-            # Qwen2.5-VL processor accepts images directly
-            inputs = self.processor(
+            # Qwen2.5-VL processor accepts images directly.
+            # Use BatchFeature.to() — handles pixel_values as list-of-tensors
+            # correctly (plain dict comprehension breaks for list values).
+            batch  = self.processor(
                 text=[text],
                 images=[pil_img],
                 return_tensors="pt",
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = batch.to(self.device)
 
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -562,7 +564,8 @@ class AsyncVLMWorker:
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"VLM worker error: {e}")
+                import traceback
+                logger.error(f"VLM worker error: {e}\n{traceback.format_exc()}")
 
     @property
     def avg_inference_ms(self) -> float:
