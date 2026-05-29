@@ -87,8 +87,8 @@ vlm:
   device: "cuda"                            # cuda on Jetson | cpu fallback on Mac
   max_new_tokens: 400
   divergence_threshold: 0.35               # trigger VLM when pred diverges this much
-  max_silence_s: 4.0                       # force VLM call after this many seconds
-  cooldown_s: 0.4                          # min gap between VLM calls
+  max_silence_s: 30.0                      # force VLM call after this many seconds
+  cooldown_s: 20.0                         # min gap between VLM calls (matches GPU-contended inference time)
 
 # ── LSTM Intent Predictor ─────────────────────────────────────────────────────
 lstm_intent_checkpoint: "~/prism_data/checkpoints/lstm_intent/model.pt"

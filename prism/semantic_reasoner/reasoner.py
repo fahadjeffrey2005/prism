@@ -487,11 +487,17 @@ class AsyncVLMWorker:
         self.model = vlm_model
         self._job_queue = queue.Queue(maxsize=1)  # only keep latest job
         self._result_queue = queue.Queue(maxsize=3)
+        self._busy = threading.Event()            # set while inference is running
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
         self._total_calls = 0
         self._total_ms = 0.0
         logger.info("Async VLM worker started")
+
+    @property
+    def is_busy(self) -> bool:
+        """True while a VLM inference is actively running."""
+        return self._busy.is_set()
 
     def post_job(
         self,
@@ -500,9 +506,11 @@ class AsyncVLMWorker:
         trigger_reason: str,
         divergence: float
     ):
-        """Post a VLM job. Non-blocking — drops old job if queue full."""
+        """Post a VLM job. Non-blocking. Drops silently if worker is busy."""
+        if self._busy.is_set():
+            return   # inference already in flight — don't pile up jobs
         try:
-            # Drop old pending job if any — only care about latest
+            # Drop any stale pending job — only care about latest
             try:
                 self._job_queue.get_nowait()
             except queue.Empty:
@@ -530,11 +538,14 @@ class AsyncVLMWorker:
             try:
                 job = self._job_queue.get(timeout=1.0)
                 t_start = time.time()
-                logger.info(f"VLM worker: picked up job trigger={job['trigger_reason']} (queued {(t_start - job['posted_at'])*1000:.0f}ms ago)")
+                self._busy.set()
+                logger.info(f"VLM worker: inference start trigger={job['trigger_reason']} (queued {(t_start - job['posted_at'])*1000:.0f}ms ago)")
 
                 response, inference_ms = self.model.infer(
                     job["image"], job["prompt"]
                 )
+
+                self._busy.clear()
 
                 output = ResponseParser.parse(
                     raw=response,
@@ -566,6 +577,7 @@ class AsyncVLMWorker:
                 continue
             except Exception as e:
                 import traceback
+                self._busy.clear()
                 logger.error(f"VLM worker error: {e}\n{traceback.format_exc()}")
 
     @property
