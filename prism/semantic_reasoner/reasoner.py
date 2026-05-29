@@ -651,6 +651,10 @@ class SemanticReasoner:
         """
         self._frame_count += 1
 
+        # VLM disabled (ablation mode) — short-circuit, return nothing
+        if not self.vlm._enabled:
+            return None
+
         # Check trigger
         trigger_reason = self.monitor.check(pred_state, world_state)
         if trigger_reason:
