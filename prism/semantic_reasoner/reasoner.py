@@ -248,19 +248,30 @@ Focus on: pedestrian intent, vehicle trajectories, any unexpected behaviors, roa
 
 class VLMModel:
     """
-    Qwen2.5-VL wrapper.
-    Handles loading, inference, and output parsing.
-    Falls back gracefully if model unavailable.
+    Qwen2.5-VL-7B-Instruct wrapper.
+    Loads from a local model directory (downloaded by scripts/download_vlm.py).
+    Falls back gracefully if model unavailable — pipeline continues in mock mode.
+
+    Local-first loading:
+        If model_dir exists on disk, it is used directly (no internet needed).
+        If model_dir is absent, falls back to downloading from HuggingFace.
+        On Jetson Thor, always prefer local dir — no Wi-Fi during inference.
     """
 
     MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-    def __init__(self, device: str = "cuda", enabled: bool = False):
-        self.device = device
-        self.model = None
+    def __init__(
+        self,
+        device:    str  = "cuda",
+        enabled:   bool = False,
+        model_dir: str  = "",
+    ):
+        self.device    = device
+        self.model_dir = model_dir
+        self.model     = None
         self.processor = None
         self._available = False
-        self._enabled = enabled
+        self._enabled   = enabled
         self._load()
 
     def _load(self):
@@ -268,28 +279,39 @@ class VLMModel:
             logger.info("VLM disabled — running in mock mode (set vlm.enabled=true to enable)")
             return
         try:
-            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
             import torch
-            logger.info(f"Loading {self.MODEL_ID}...")
+
+            # Prefer local model dir; fall back to HuggingFace hub
+            from pathlib import Path as _Path
+            local = _Path(self.model_dir).expanduser() if self.model_dir else None
+            source = str(local) if (local and local.exists()) else self.MODEL_ID
+
+            logger.info(f"Loading Qwen2.5-VL-7B from: {source}")
+
             self.processor = AutoProcessor.from_pretrained(
-                self.MODEL_ID,
-                trust_remote_code=True
-            )
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                self.MODEL_ID,
-                torch_dtype="auto",
+                source,
                 trust_remote_code=True,
             )
-            # Force CPU for VLM — MPS has token mismatch bug with Qwen2-VL
-            # VLM runs in background thread so CPU doesn't block fast loop
-            self.model = self.model.to("cpu")
-            logger.info("Qwen2-VL loaded on CPU (async background thread)")
+
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                source,
+                torch_dtype=dtype,
+                device_map=self.device,
+                trust_remote_code=True,
+            )
             self.model.eval()
             self._available = True
-            logger.info("VLM ready")
+            logger.info(f"Qwen2.5-VL-7B ready on {self.device}")
+
         except ImportError as e:
-            logger.warning(f"transformers version may not support Qwen2.5-VL: {e}")
-            logger.warning("Running in MOCK mode — install: pip install transformers>=4.45")
+            logger.warning(f"transformers missing or too old for Qwen2.5-VL: {e}")
+            logger.warning(
+                "Running in MOCK mode.\n"
+                "Install: /home/koushik-test/cad_pipeline_env/bin/pip install "
+                "transformers accelerate qwen-vl-utils Pillow"
+            )
             self._available = False
         except Exception as e:
             logger.warning(f"VLM load failed: {e}")
@@ -311,9 +333,8 @@ class VLMModel:
         try:
             import torch
             from PIL import Image as PILImage
-            from qwen_vl_utils import process_vision_info
 
-            # Prepare image
+            # Convert BGR → RGB
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             pil_img = PILImage.fromarray(rgb)
 
@@ -322,7 +343,7 @@ class VLMModel:
                     "role": "user",
                     "content": [
                         {"type": "image", "image": pil_img},
-                        {"type": "text", "text": prompt},
+                        {"type": "text",  "text": prompt},
                     ],
                 }
             ]
@@ -330,15 +351,14 @@ class VLMModel:
             text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-            image_inputs, video_inputs = process_vision_info(messages)
+
+            # Qwen2.5-VL processor accepts images directly
             inputs = self.processor(
                 text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
+                images=[pil_img],
                 return_tensors="pt",
             )
-            inputs = inputs.to("cpu")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -351,14 +371,11 @@ class VLMModel:
                 )
             inference_ms = (time.perf_counter() - t0) * 1000
 
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):]
-                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            response = self.processor.batch_decode(
-                generated_ids_trimmed,
+            input_len = inputs["input_ids"].shape[1]
+            response  = self.processor.batch_decode(
+                generated_ids[:, input_len:],
                 skip_special_tokens=True,
-                clean_up_tokenization_spaces=False
+                clean_up_tokenization_spaces=True,
             )[0]
 
             return response, inference_ms
@@ -589,7 +606,11 @@ class SemanticReasoner:
         self.prompt_builder = PromptBuilder()
         vlm_enabled = vlm_cfg.get("enabled", False)
         VLMModel.MODEL_ID = vlm_cfg.get("model_id", VLMModel.MODEL_ID)
-        self.vlm = VLMModel(device=device, enabled=vlm_enabled)
+        model_dir   = vlm_cfg.get(
+            "model_dir",
+            "/home/koushik-test/prism_data/models/qwen2_5_vl_7b",
+        )
+        self.vlm = VLMModel(device=device, enabled=vlm_enabled, model_dir=model_dir)
         self.worker = AsyncVLMWorker(self.vlm)
 
         # Latest known semantic state — persists between VLM calls

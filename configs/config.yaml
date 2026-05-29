@@ -82,7 +82,8 @@ cameras:
 # ── VLM Semantic Reasoner ─────────────────────────────────────────────────────
 vlm:
   enabled: true                             # set false on Mac (MPS unsupported for Qwen)
-  model_id: "Qwen/Qwen2.5-VL-7B-Instruct"  # 7B on Jetson Thor (131GB unified RAM)
+  model_id: "Qwen/Qwen2.5-VL-7B-Instruct"  # HuggingFace hub ID (fallback if local dir absent)
+  model_dir: "~/prism_data/models/qwen2_5_vl_7b"  # local path — preferred on Jetson
   device: "cuda"                            # cuda on Jetson | cpu fallback on Mac
   max_new_tokens: 400
   divergence_threshold: 0.35               # trigger VLM when pred diverges this much
