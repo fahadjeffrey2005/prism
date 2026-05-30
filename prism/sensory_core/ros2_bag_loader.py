@@ -321,7 +321,7 @@ class ROS2BagLoader:
         ).fetchone()
         bag_start_ns  = bounds[0]
         filter_start  = bag_start_ns + int(start_s * 1e9) if start_s else 0
-        filter_end    = bag_start_ns + int(end_s   * 1e9) if end_s   else 2**63
+        filter_end    = bag_start_ns + int(end_s   * 1e9) if end_s   else 2**63 - 1
 
         wanted_ids = set()
         for t in [TOPIC_IMAGE, TOPIC_CAMINFO, TOPIC_LIDAR]:
