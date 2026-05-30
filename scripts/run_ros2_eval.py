@@ -138,29 +138,27 @@ def run_frame(
                 run_model=(frame_idx % 3 == 0),
             )
 
-    # ── Fuse: merge camera metric_dets + LiDAR detections ────────────────────
-    # Build unified actor list: prefer camera dets, fill in with LiDAR if no camera
-    fused_actors = list(metric_dets)
-
-    # Add LiDAR-only detections that don't overlap with any camera detection
-    for lidar_det in lidar_dets:
-        if lidar_det.distance_m <= 0:
-            continue
-        # Check if any camera detection is nearby (within 3m)
-        overlaps = False
-        for cam_det in metric_dets:
-            if (abs(cam_det.distance_m - lidar_det.distance_m) < 3.0 and
-                    abs(cam_det.lateral_m - lidar_det.lateral_m) < 2.0):
-                overlaps = True
-                break
-        if not overlaps:
-            # Wrap LiDAR det as a pseudo-MetricDetection for WorldModel
-            fused_actors.append(_lidar_to_metric_det(lidar_det, timestamp, frame_idx))
+    # ── Fuse: inject LiDAR-only detections into SensoryFrame ─────────────────
+    # WorldModel reads from sensory_frame.detections — add LiDAR blobs that
+    # don't overlap any camera detection so the tracker sees them too.
+    if sensory_frame is not None and lidar_dets:
+        for lidar_det in lidar_dets:
+            if lidar_det.distance_m <= 0:
+                continue
+            overlaps = any(
+                abs(cd.distance_m - lidar_det.distance_m) < 3.0 and
+                abs(getattr(cd, 'lateral_m', 0) - lidar_det.lateral_m) < 2.0
+                for cd in metric_dets
+            )
+            if not overlaps:
+                sensory_frame.detections.append(
+                    _lidar_to_detection(lidar_det, timestamp, frame_idx)
+                )
 
     # ── Layer 2: WorldModel ───────────────────────────────────────────────────
     world_state = None
     if sensory_frame is not None:
-        world_state = world_model.update(sensory_frame, metric_dets=fused_actors)
+        world_state = world_model.update(sensory_frame)
 
     # ── Layer 3: PredictiveEngine ─────────────────────────────────────────────
     pred_state = None
@@ -203,27 +201,19 @@ def run_frame(
     }
 
 
-def _lidar_to_metric_det(lidar_det: LiDARDetection, timestamp: float, frame_idx: int):
-    """Wrap a LiDARDetection as a pseudo MetricDetection for the WorldModel."""
-    from prism.sensory_core.metric_depth import MetricDetection
-    from prism.utils.common import BBox2D
+def _lidar_to_detection(lidar_det: LiDARDetection, timestamp: float, frame_idx: int):
+    """Wrap a LiDARDetection as a Detection so SensoryFrame / WorldModel can use it."""
+    from prism.utils.common import Detection, BBox2D
 
-    # Dummy bbox — WorldModel needs this but won't render it for LiDAR-only dets
-    dummy_bbox = BBox2D(x1=0, y1=0, x2=1, y2=1, confidence=0.9,
-                        class_id=2, class_name="car")
-    return MetricDetection(
-        bbox=dummy_bbox,
-        class_name="car",   # conservative: treat unknown LiDAR blobs as cars
-        class_id=2,
-        confidence=0.80,
-        camera_name="lidar",
-        frame_idx=frame_idx,
-        timestamp=timestamp,
-        distance_m=lidar_det.distance_m,
-        lateral_m=lidar_det.lateral_m,
-        depth_method="lidar",
-        depth_confidence=0.95,
-    )
+    # Synthetic bbox — centred in image, width proportional to lateral size
+    dummy_bbox = BBox2D(x1=300, y1=200, x2=340, y2=280,
+                        confidence=0.85, class_id=2, class_name="car")
+    det = Detection(bbox=dummy_bbox)
+    det.depth_estimate = lidar_det.distance_m   # real metric distance from LiDAR
+    det.camera_name    = "lidar"
+    det.frame_idx      = frame_idx
+    det.timestamp      = timestamp
+    return det
 
 
 # ── Annotation helper ─────────────────────────────────────────────────────────
