@@ -32,7 +32,7 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
 
 def load_config(config_path: Optional[str] = None) -> dict:
     if config_path is None:
-        config_path = Path(__file__).parent.parent / "configs" / "config.yaml"
+        config_path = Path(__file__).parent.parent.parent / "configs" / "config.yaml"
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     # Expand ~ in paths
