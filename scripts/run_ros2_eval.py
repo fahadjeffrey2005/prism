@@ -80,12 +80,13 @@ NEAR_MISS_THRESH_M = 4.0
 
 # ── Pipeline builder ──────────────────────────────────────────────────────────
 
-def build_pipeline(cfg: dict, vlm_enabled: bool = True):
-    """Construct and return PRISM pipeline components."""
+def build_pipeline(cfg: dict, vlm_enabled: bool = True) -> dict:
+    """Construct and return PRISM pipeline dict — mirrors run_closedloop_eval."""
     from prism.sensory_core.core import SensoryCore
     from prism.sensory_core.metric_depth import MetricDepthEngine
     from prism.world_model.world_model import WorldModel
     from prism.predictive_engine.engine import PredictiveEngine
+    from prism.predictive_engine.decision import SmartDecisionEngine
     from prism.semantic_reasoner.reasoner import SemanticReasoner
     from prism.arbitration.core import ArbitrationCore
     from prism.planner.planner import AdaptivePlanner
@@ -95,15 +96,16 @@ def build_pipeline(cfg: dict, vlm_enabled: bool = True):
         cfg["vlm"] = dict(cfg.get("vlm", {}))
         cfg["vlm"]["enabled"] = False
 
-    sensory_core  = SensoryCore(cfg)
-    metric_engine = MetricDepthEngine(cfg)
-    world_model   = WorldModel(cfg)
-    pred_engine   = PredictiveEngine(cfg)
-    reasoner      = SemanticReasoner(cfg)
-    arbitration   = ArbitrationCore(cfg)
-    planner       = AdaptivePlanner(cfg)
-
-    return sensory_core, metric_engine, world_model, pred_engine, reasoner, arbitration, planner
+    return {
+        "core":       SensoryCore(cfg),
+        "depth":      MetricDepthEngine(cfg),
+        "world":      WorldModel(cfg),
+        "predictor":  PredictiveEngine(cfg),
+        "decision":   SmartDecisionEngine(),
+        "reasoner":   SemanticReasoner(cfg),
+        "arbitrator": ArbitrationCore(cfg),
+        "planner":    AdaptivePlanner(cfg),
+    }
 
 
 # ── Per-frame pipeline ────────────────────────────────────────────────────────
@@ -113,41 +115,37 @@ def run_frame(
     lidar_dets: List[LiDARDetection],
     timestamp: float,
     frame_idx: int,
-    components: tuple,
+    pipeline: dict,
+    calib: dict,
     camera_name: str = "usb_cam",
 ) -> dict:
     """
     Run one frame through the full 6-layer PRISM pipeline.
-    Returns a metrics dict for this frame.
+    Mirrors run_closedloop_eval.run_frame() exactly.
     """
-    sensory_core, metric_engine, world_model, pred_engine, reasoner, arbitration, planner = components
     t0 = time.perf_counter()
 
-    # ── Layer 1: SensoryCore (camera only) ───────────────────────────────────
+    # ── Layer 1: SensoryCore ─────────────────────────────────────────────────
     sensory_frame = None
     metric_dets   = []
 
     if image is not None:
-        sensory_frame = sensory_core.process(image, camera_name=camera_name, timestamp=timestamp)
+        sensory_frame = pipeline["core"].process(
+            image, camera_name=camera_name, timestamp=timestamp
+        )
+        pipeline["depth"].update_intrinsics(calib)
+        metric_dets, _ = pipeline["depth"].process_frame(
+            image, sensory_frame.detections,
+            run_model=sensory_frame.depth_map is not None,
+        )
 
-        # ── Layer 1b: MetricDepth ─────────────────────────────────────────────
-        if sensory_frame.detections:
-            metric_dets, _ = metric_engine.process_frame(
-                image,
-                sensory_frame.detections,
-                run_model=(frame_idx % 3 == 0),
-            )
-
-    # ── Fuse: inject LiDAR-only detections into SensoryFrame ─────────────────
-    # WorldModel reads from sensory_frame.detections — add LiDAR blobs that
-    # don't overlap any camera detection so the tracker sees them too.
-    if sensory_frame is not None and lidar_dets:
+        # Inject LiDAR-only blobs that don't overlap camera detections
         for lidar_det in lidar_dets:
             if lidar_det.distance_m <= 0:
                 continue
             overlaps = any(
                 abs(cd.distance_m - lidar_det.distance_m) < 3.0 and
-                abs(getattr(cd, 'lateral_m', 0) - lidar_det.lateral_m) < 2.0
+                abs(cd.lateral_m - lidar_det.lateral_m) < 2.0
                 for cd in metric_dets
             )
             if not overlaps:
@@ -158,27 +156,38 @@ def run_frame(
     # ── Layer 2: WorldModel ───────────────────────────────────────────────────
     world_state = None
     if sensory_frame is not None:
-        world_state = world_model.update(sensory_frame)
+        world_state = pipeline["world"].update(sensory_frame, calibration=calib)
 
     # ── Layer 3: PredictiveEngine ─────────────────────────────────────────────
     pred_state = None
     if world_state is not None:
-        pred_state = pred_engine.predict(world_state)
+        pred_state = pipeline["predictor"].update(world_state, metric_dets)
+
+    # ── Layer 3b: SmartDecisionEngine ────────────────────────────────────────
+    scene = None
+    if world_state is not None and pred_state is not None:
+        scene = pipeline["decision"].assess(world_state, pred_state, metric_dets)
 
     # ── Layer 4: SemanticReasoner (VLM) ───────────────────────────────────────
     vlm_out = None
     if image is not None and world_state is not None and pred_state is not None:
-        vlm_out = reasoner.update(image, world_state, pred_state)
+        vlm_out = pipeline["reasoner"].update(image, world_state, pred_state)
+        if vlm_out and vlm_out.actor_intents:
+            pipeline["predictor"].update_vlm_intents(vlm_out.actor_intents)
+        if vlm_out:
+            pipeline["arbitrator"].update_vlm(vlm_out.to_arb_dict())
 
-    # ── Layer 5: ArbitrationCore ───────────────────────────────────────────────
+    # ── Layer 5: ArbitrationCore ──────────────────────────────────────────────
     arb = None
-    if pred_state is not None:
-        arb = arbitration.decide(pred_state, world_state, vlm_output=vlm_out)
+    if pred_state is not None and scene is not None:
+        arb = pipeline["arbitrator"].arbitrate(
+            world_state, pred_state, scene, timestamp=timestamp
+        )
 
     # ── Layer 6: AdaptivePlanner ──────────────────────────────────────────────
     control = None
     if arb is not None:
-        control = planner.plan(arb, world_state)
+        control = pipeline["planner"].plan(arb, metric_dets=metric_dets, timestamp=timestamp)
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -188,7 +197,7 @@ def run_frame(
         "latency_ms":   latency_ms,
         "n_cam_dets":   len(metric_dets),
         "n_lidar_dets": len(lidar_dets),
-        "n_fused":      len(fused_actors),
+        "n_fused":      len(metric_dets) + len(lidar_dets),
         "decision":     arb.decision if arb else "UNKNOWN",
         "risk":         float(arb.risk_score) if arb else 0.0,
         "speed_mps":    float(control.speed_setpoint_mps) if control else 0.0,
@@ -292,10 +301,7 @@ def evaluate_bag(
 
     # ── Build pipeline ────────────────────────────────────────────────────────
     logger.info("Building PRISM pipeline...")
-    components = build_pipeline(cfg, vlm_enabled=vlm_enabled)
-    sensory_core, metric_engine, *_ = components
-
-    # ── LiDAR processor ───────────────────────────────────────────────────────
+    pipeline   = build_pipeline(cfg, vlm_enabled=vlm_enabled)
     lidar_proc = LiDARProcessor()
 
     # ── Bag loader ────────────────────────────────────────────────────────────
@@ -328,12 +334,11 @@ def evaluate_bag(
             cloud      = frame_data["point_cloud"] # (N,4) or None
             intrinsics = frame_data["intrinsics"]
 
-            # Update MetricDepthEngine intrinsics once calibration arrives
+            # Build calib dict from live intrinsics (or empty fallback)
+            calib = intrinsics.to_calibration_dict() if intrinsics is not None else {}
             if intrinsics is not None and not intrinsics_set:
-                calib_dict = intrinsics.to_calibration_dict()
-                metric_engine.update_intrinsics(calib_dict)
                 intrinsics_set = True
-                logger.info(f"Updated intrinsics from bag: {intrinsics}")
+                logger.info(f"Intrinsics from bag: {intrinsics}")
 
             # Process LiDAR
             lidar_dets = lidar_proc.process(cloud) if cloud is not None else []
@@ -344,7 +349,8 @@ def evaluate_bag(
                 lidar_dets = lidar_dets,
                 timestamp  = ts,
                 frame_idx  = frame_count,
-                components = components,
+                pipeline   = pipeline,
+                calib      = calib,
             )
 
             # Accumulate metrics
