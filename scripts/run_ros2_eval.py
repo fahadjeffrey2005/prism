@@ -58,9 +58,9 @@ logger = get_logger("ROS2Eval")
 BAGS_ROOT = Path(__file__).parent.parent / "prism" / "new data"
 
 BAG_REGISTRY = {
-    "test1":    BAGS_ROOT / "test1"    / "test1.db3",
-    "test2":    BAGS_ROOT / "test2"    / "test12.db3",
-    "ros2_bag": BAGS_ROOT / "ros2_bag" / "ros2_bag.db3",
+    "test1":    Path.home() / "Downloads" / "test1-003.db3",
+    "test2":    Path.home() / "Downloads" / "test12-002.db3",
+    "ros2_bag": BAGS_ROOT  / "ros2_bag"  / "ros2_bag.db3",
 }
 
 # ── USB camera defaults (fallback if camera_info not in bag) ─────────────────
