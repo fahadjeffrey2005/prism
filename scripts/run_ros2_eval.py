@@ -170,12 +170,21 @@ def run_frame(
 
     # ── Layer 4: SemanticReasoner (VLM) ───────────────────────────────────────
     vlm_out = None
+    vlm_summary = ""
+    vlm_intents = {}
     if image is not None and world_state is not None and pred_state is not None:
         vlm_out = pipeline["reasoner"].update(image, world_state, pred_state)
-        if vlm_out and vlm_out.actor_intents:
-            pipeline["predictor"].update_vlm_intents(vlm_out.actor_intents)
         if vlm_out:
+            vlm_summary = getattr(vlm_out, "scene_summary", "")
+            vlm_intents = getattr(vlm_out, "actor_intents", {})
+            if vlm_out.actor_intents:
+                pipeline["predictor"].update_vlm_intents(vlm_out.actor_intents)
             pipeline["arbitrator"].update_vlm(vlm_out.to_arb_dict())
+            logger.info(
+                f"[VLM fired @ frame {frame_idx}] "
+                f"summary='{vlm_summary}' | "
+                f"intents={vlm_intents}"
+            )
 
     # ── Layer 5: ArbitrationCore ──────────────────────────────────────────────
     arb = None
@@ -202,6 +211,8 @@ def run_frame(
         "risk":         float(1.0 - arb.speed_factor) if arb else 0.0,
         "speed_mps":    float(control.target_speed_mps) if control else 0.0,
         "vlm_fired":    vlm_out is not None,
+        "vlm_summary":  vlm_summary,
+        "vlm_intents":  {str(k): v for k, v in vlm_intents.items()},
         "sensory_frame": sensory_frame,
         "control":      control,
         "arb":          arb,
@@ -321,6 +332,7 @@ def evaluate_bag(
     decisions   = defaultdict(int)
     latencies   = []
     vlm_fires   = 0
+    vlm_events  = []   # list of {frame_idx, timestamp, summary, intents, decision}
     frame_count = 0
     start_wall  = time.time()
 
@@ -358,6 +370,14 @@ def evaluate_bag(
             latencies.append(result["latency_ms"])
             if result["vlm_fired"]:
                 vlm_fires += 1
+                vlm_events.append({
+                    "frame_idx": frame_count,
+                    "timestamp": ts,
+                    "summary":   result.get("vlm_summary", ""),
+                    "intents":   result.get("vlm_intents", {}),
+                    "decision":  result["decision"],
+                    "risk":      result["risk"],
+                })
 
             # Video output
             if save_video and image is not None:
@@ -411,6 +431,7 @@ def evaluate_bag(
         "vlm_trigger_rate_pct": round(100 * vlm_fires / frame_count, 2),
         "decision_distribution": dict(decisions),
         "intrinsics_from_bag":   intrinsics_set,
+        "vlm_events":            vlm_events,
     }
 
     logger.info(f"\n{'='*60}")
@@ -421,7 +442,15 @@ def evaluate_bag(
     logger.info(f"Wall time:       {total_elapsed:.1f}s  ({results['avg_fps']:.1f} fps)")
     logger.info(f"Avg latency:     {results['avg_latency_ms']}ms")
     logger.info(f"P95 latency:     {results['p95_latency_ms']}ms")
-    logger.info(f"VLM trigger:     {results['vlm_trigger_rate_pct']}%")
+    logger.info(f"VLM trigger:     {results['vlm_trigger_rate_pct']}%  ({vlm_fires} fires)")
+    if vlm_events:
+        logger.info("VLM events:")
+        for ev in vlm_events:
+            logger.info(
+                f"  [frame {ev['frame_idx']:04d} t={ev['timestamp']:.1f}s] "
+                f"dec={ev['decision']}  risk={ev['risk']:.2f} | "
+                f"\"{ev['summary']}\"  intents={ev['intents']}"
+            )
     logger.info("Decision distribution:")
     for dec, cnt in sorted(decisions.items(), key=lambda x: -x[1]):
         pct = 100 * cnt / frame_count

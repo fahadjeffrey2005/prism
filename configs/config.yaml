@@ -86,9 +86,9 @@ vlm:
   model_dir: "~/prism_data/models/qwen2_5_vl_7b"  # local path — preferred on Jetson
   device: "cuda"                            # cuda on Jetson | cpu fallback on Mac
   max_new_tokens: 400
-  divergence_threshold: 0.35               # trigger VLM when pred diverges this much
-  max_silence_s: 30.0                      # force VLM call after this many seconds
-  cooldown_s: 20.0                         # min gap between VLM calls (matches GPU-contended inference time)
+  divergence_threshold: 0.15               # trigger VLM when pred diverges this much (lowered for real-world data)
+  max_silence_s: 15.0                      # force VLM call after this many seconds
+  cooldown_s: 8.0                          # min gap between VLM calls
 
 # ── LSTM Intent Predictor ─────────────────────────────────────────────────────
 lstm_intent_checkpoint: "~/prism_data/checkpoints/lstm_intent/model.pt"
