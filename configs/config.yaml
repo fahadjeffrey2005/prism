@@ -3,8 +3,8 @@
 
 project:
   name: PRISM
-  version: "0.1.0"
-  description: "Camera-only autonomous mobility stack with VLM reasoning"
+  version: "0.2.0"
+  description: "Predictive Reasoning and Intuition System for Mobility — camera + LiDAR fusion"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
@@ -48,7 +48,7 @@ sensory_core:
     run_every_n_frames: 1                   # every frame — lightweight
 
   sampling:
-    camera_fps: 12                          # nuScenes is 12fps
+    camera_fps: 12                          # nuScenes is 12fps; USB cam ~10fps
     detection_fps: 12
     depth_fps: 4
     segmentation_fps: 4
@@ -103,6 +103,68 @@ planner:
   plan_horizon_s:       3.0    # seconds of lookahead
   plan_dt_s:            0.1    # 10 Hz planning rate
   safety_margin_m:      3.0    # clearance ahead of nearest corridor obstacle
+
+# ── ROS2 Bag Data ─────────────────────────────────────────────────────────────
+ros2_bag:
+  data_root: "prism/new data"               # relative to project root
+  bags:
+    test1:    "test1/test1.db3"             # ~237s  camera + LiDAR + IMU
+    test2:    "test2/test12.db3"            # ~71s   camera + LiDAR + IMU
+    ros2_bag: "ros2_bag/ros2_bag.db3"       # ~208s  LiDAR + IMU only (no camera)
+
+  topics:
+    camera:      "/usb_cam/image_raw"
+    camera_info: "/usb_cam/camera_info"
+    lidar:       "/velodyne_points"
+    imu:         "/imu/data"
+
+  sync_tolerance_s: 0.08                   # max camera-LiDAR time gap for sync
+
+  # USB camera fallback intrinsics (used if camera_info not in bag)
+  usb_cam_defaults:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480
+
+# ── LiDAR Processor ───────────────────────────────────────────────────────────
+lidar:
+  # SOR outlier removal
+  sor_k: 20
+  sor_std_ratio: 1.0
+
+  # Voxel downsampling
+  voxel_size: 0.10                          # metres
+
+  # Ground removal (matches lidarGroundRemove.cpp defaults)
+  grid_res: 0.5
+  height_margin: 0.25
+  max_range: 40.0
+  dilation_steps: 3
+  min_pts_in_cell: 1
+
+  # Range-adaptive DBSCAN (matches boundingBox.cpp defaults)
+  eps_near: 0.20
+  eps_range_factor: 0.05
+  min_pts_near: 5
+  min_pts_far: 2
+  far_range: 20.0
+  min_cluster_near: 30
+  min_cluster_far: 5
+  far_cluster_range: 20.0
+
+  # Cluster filters
+  max_box_dimension: 15.0                   # metres any axis
+  min_box_volume: 0.01                      # m³
+  max_ground_clearance: 0.5                 # m
+  min_point_density: 5.0                    # pts/m³
+  density_range_factor: 0.05
+  merge_distance: 1.5                       # metres — merge nearby AABBs
+  min_forward_dist: 0.5                     # only keep objects ahead
+  max_forward_dist: 50.0
+  max_lateral_dist: 20.0
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
