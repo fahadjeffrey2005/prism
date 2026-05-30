@@ -312,7 +312,7 @@ def evaluate_bag(
     loader = ROS2BagLoader(bag_path)
     info = loader.get_bag_info()
     logger.info(f"Bag duration: {info['duration_s']:.1f}s")
-    logger.info(f"Topics: {list(info['topics'].keys())}")
+    logger.info(f"Topics: {info['topics']}")
 
     # ── Update camera intrinsics once we get them ─────────────────────────────
     intrinsics_set = False
