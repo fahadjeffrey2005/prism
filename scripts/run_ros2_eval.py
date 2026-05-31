@@ -236,6 +236,77 @@ def _lidar_to_detection(lidar_det: LiDARDetection, timestamp: float, frame_idx: 
     return det
 
 
+def run_frame_lidar_only(
+    lidar_dets: List[LiDARDetection],
+    timestamp: float,
+    frame_idx: int,
+    pipeline: dict,
+) -> dict:
+    """
+    Run one LiDAR-only frame through the pipeline (no camera, no VLM).
+    Builds a synthetic SensoryFrame from LiDAR detections and runs
+    WorldModel → PredictiveEngine → SmartDecisionEngine → Arbitration → Planner.
+    """
+    from prism.utils.common import SensoryFrame
+
+    t0 = time.perf_counter()
+
+    # Build synthetic SensoryFrame from LiDAR detections
+    sensory_frame = SensoryFrame(
+        frame_idx  = frame_idx,
+        timestamp  = timestamp,
+        camera_name = "lidar_only",
+    )
+    sensory_frame.detections = [
+        _lidar_to_detection(d, timestamp, frame_idx) for d in lidar_dets
+    ]
+
+    # WorldModel
+    world_state = pipeline["world"].update(sensory_frame, calibration={})
+
+    # PredictiveEngine
+    pred_state = pipeline["predictor"].update(world_state, []) if world_state else None
+
+    # SmartDecisionEngine
+    scene = None
+    if world_state and pred_state:
+        scene = pipeline["decision"].assess(world_state, pred_state, [])
+
+    # Arbitration
+    arb = None
+    if pred_state and scene:
+        arb = pipeline["arbitrator"].arbitrate(
+            world_state, pred_state, scene, timestamp=timestamp
+        )
+
+    # Planner
+    control = None
+    if arb:
+        control = pipeline["planner"].plan(arb, metric_dets=[], timestamp=timestamp)
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    return {
+        "frame_idx":    frame_idx,
+        "timestamp":    timestamp,
+        "latency_ms":   latency_ms,
+        "n_cam_dets":   0,
+        "n_lidar_dets": len(lidar_dets),
+        "n_fused":      len(lidar_dets),
+        "decision":     arb.action if arb else "UNKNOWN",
+        "risk":         float(1.0 - arb.speed_factor) if arb else 0.0,
+        "speed_mps":    float(control.target_speed_mps) if control else 0.0,
+        "vlm_fired":    False,
+        "vlm_summary":  "",
+        "vlm_intents":  {},
+        "sensory_frame": sensory_frame,
+        "control":      control,
+        "arb":          arb,
+        "world_state":  world_state,
+        "image_bgr":    None,
+    }
+
+
 # ── Annotation helper ─────────────────────────────────────────────────────────
 
 def annotate_frame(
@@ -321,6 +392,15 @@ def evaluate_bag(
     logger.info(f"Bag duration: {info['duration_s']:.1f}s")
     logger.info(f"Topics: {info['topics']}")
 
+    # ── Detect LiDAR-only bag ─────────────────────────────────────────────────
+    has_camera = any(
+        t in info["topics"]
+        for t in ["/usb_cam/image_raw", "/camera/image_raw"]
+    )
+    lidar_only_mode = not has_camera
+    if lidar_only_mode:
+        logger.info("No camera topic detected — running in LiDAR-only mode (no VLM)")
+
     # ── Update camera intrinsics once we get them ─────────────────────────────
     intrinsics_set = False
 
@@ -337,74 +417,106 @@ def evaluate_bag(
     start_wall  = time.time()
 
     try:
-        for frame_data in loader.iter_frames(
-            sync_tolerance_s=0.08,
-            max_frames=max_frames if max_frames > 0 else None,
-        ):
-            ts         = frame_data["timestamp"]
-            image      = frame_data["image"]      # BGR or None
-            cloud      = frame_data["point_cloud"] # (N,4) or None
-            intrinsics = frame_data["intrinsics"]
+        if lidar_only_mode:
+            # ── LiDAR-only iteration ──────────────────────────────────────────
+            for frame_data in loader.iter_lidar_only(
+                max_frames=max_frames if max_frames > 0 else None,
+            ):
+                ts    = frame_data["timestamp"]
+                cloud = frame_data["point_cloud"]
 
-            # Build calib dict from live intrinsics (or empty fallback)
-            calib = intrinsics.to_calibration_dict() if intrinsics is not None else {}
-            if intrinsics is not None and not intrinsics_set:
-                intrinsics_set = True
-                logger.info(f"Intrinsics from bag: {intrinsics}")
+                lidar_dets = lidar_proc.process(cloud) if cloud is not None else []
 
-            # Process LiDAR
-            lidar_dets = lidar_proc.process(cloud) if cloud is not None else []
-
-            # Run pipeline
-            result = run_frame(
-                image      = image,
-                lidar_dets = lidar_dets,
-                timestamp  = ts,
-                frame_idx  = frame_count,
-                pipeline   = pipeline,
-                calib      = calib,
-            )
-
-            # Accumulate metrics
-            decisions[result["decision"]] += 1
-            latencies.append(result["latency_ms"])
-            if result["vlm_fired"]:
-                vlm_fires += 1
-                vlm_events.append({
-                    "frame_idx": frame_count,
-                    "timestamp": ts,
-                    "summary":   result.get("vlm_summary", ""),
-                    "intents":   result.get("vlm_intents", {}),
-                    "decision":  result["decision"],
-                    "risk":      result["risk"],
-                })
-
-            # Video output
-            if save_video and image is not None:
-                annotated = annotate_frame(image, result, lidar_dets)
-                if video_writer is None:
-                    h, w = annotated.shape[:2]
-                    if output_dir:
-                        vid_path = output_dir / f"ros2_eval_{bag_name}.mp4"
-                    else:
-                        vid_path = Path(f"/tmp/ros2_eval_{bag_name}.mp4")
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(str(vid_path), fourcc, 10, (w, h))
-                    logger.info(f"Video writer opened: {vid_path}")
-                video_writer.write(annotated)
-
-            frame_count += 1
-
-            # Progress log
-            if frame_count % 50 == 0:
-                elapsed = time.time() - start_wall
-                fps     = frame_count / elapsed
-                logger.info(
-                    f"  Frame {frame_count} | {fps:.1f}fps | "
-                    f"lat={result['latency_ms']:.0f}ms | "
-                    f"cam={result['n_cam_dets']} lidar={result['n_lidar_dets']} | "
-                    f"dec={result['decision']}"
+                result = run_frame_lidar_only(
+                    lidar_dets = lidar_dets,
+                    timestamp  = ts,
+                    frame_idx  = frame_count,
+                    pipeline   = pipeline,
                 )
+
+                decisions[result["decision"]] += 1
+                latencies.append(result["latency_ms"])
+
+                frame_count += 1
+                if frame_count % 100 == 0:
+                    elapsed = time.time() - start_wall
+                    fps     = frame_count / elapsed
+                    logger.info(
+                        f"  Frame {frame_count} | {fps:.1f}fps | "
+                        f"lat={result['latency_ms']:.0f}ms | "
+                        f"lidar={result['n_lidar_dets']} | "
+                        f"dec={result['decision']}"
+                    )
+        else:
+            # ── Camera + LiDAR iteration ──────────────────────────────────────
+            for frame_data in loader.iter_frames(
+                sync_tolerance_s=0.08,
+                max_frames=max_frames if max_frames > 0 else None,
+            ):
+                ts         = frame_data["timestamp"]
+                image      = frame_data["image"]      # BGR or None
+                cloud      = frame_data["point_cloud"] # (N,4) or None
+                intrinsics = frame_data["intrinsics"]
+
+                # Build calib dict from live intrinsics (or empty fallback)
+                calib = intrinsics.to_calibration_dict() if intrinsics is not None else {}
+                if intrinsics is not None and not intrinsics_set:
+                    intrinsics_set = True
+                    logger.info(f"Intrinsics from bag: {intrinsics}")
+
+                # Process LiDAR
+                lidar_dets = lidar_proc.process(cloud) if cloud is not None else []
+
+                # Run pipeline
+                result = run_frame(
+                    image      = image,
+                    lidar_dets = lidar_dets,
+                    timestamp  = ts,
+                    frame_idx  = frame_count,
+                    pipeline   = pipeline,
+                    calib      = calib,
+                )
+
+                # Accumulate metrics
+                decisions[result["decision"]] += 1
+                latencies.append(result["latency_ms"])
+                if result["vlm_fired"]:
+                    vlm_fires += 1
+                    vlm_events.append({
+                        "frame_idx": frame_count,
+                        "timestamp": ts,
+                        "summary":   result.get("vlm_summary", ""),
+                        "intents":   result.get("vlm_intents", {}),
+                        "decision":  result["decision"],
+                        "risk":      result["risk"],
+                    })
+
+                # Video output
+                if save_video and image is not None:
+                    annotated = annotate_frame(image, result, lidar_dets)
+                    if video_writer is None:
+                        h, w = annotated.shape[:2]
+                        if output_dir:
+                            vid_path = output_dir / f"ros2_eval_{bag_name}.mp4"
+                        else:
+                            vid_path = Path(f"/tmp/ros2_eval_{bag_name}.mp4")
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(str(vid_path), fourcc, 10, (w, h))
+                        logger.info(f"Video writer opened: {vid_path}")
+                    video_writer.write(annotated)
+
+                frame_count += 1
+
+                # Progress log
+                if frame_count % 50 == 0:
+                    elapsed = time.time() - start_wall
+                    fps     = frame_count / elapsed
+                    logger.info(
+                        f"  Frame {frame_count} | {fps:.1f}fps | "
+                        f"lat={result['latency_ms']:.0f}ms | "
+                        f"cam={result['n_cam_dets']} lidar={result['n_lidar_dets']} | "
+                        f"dec={result['decision']}"
+                    )
 
     finally:
         if video_writer is not None:
@@ -431,6 +543,7 @@ def evaluate_bag(
         "vlm_trigger_rate_pct": round(100 * vlm_fires / frame_count, 2),
         "decision_distribution": dict(decisions),
         "intrinsics_from_bag":   intrinsics_set,
+        "lidar_only_mode":       lidar_only_mode,
         "vlm_events":            vlm_events,
     }
 
