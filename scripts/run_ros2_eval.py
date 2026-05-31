@@ -309,56 +309,183 @@ def run_frame_lidar_only(
 
 # ── Annotation helper ─────────────────────────────────────────────────────────
 
+# VLM text state — persists on screen for several frames after firing
+_vlm_text_buffer: str = ""
+_vlm_text_ttl: int = 0          # frames remaining to show VLM text
+VLM_TEXT_HOLD_FRAMES = 60       # ~5 seconds at 12 fps
+
+
+def _blend_rect(img, x1, y1, x2, y2, color, alpha=0.55):
+    """Draw a semi-transparent filled rectangle."""
+    roi = img[y1:y2, x1:x2]
+    if roi.size == 0:
+        return
+    overlay = roi.copy()
+    cv2.rectangle(overlay, (0, 0), (x2 - x1, y2 - y1), color, -1)
+    img[y1:y2, x1:x2] = cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0)
+
+
+def _draw_risk_bar(img, x, y, w, h, risk, label="RISK"):
+    """Draw a vertical risk bar on the right edge."""
+    # Background
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 40), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (80, 80, 80), 1)
+    # Fill
+    fill_h = int(h * risk)
+    if fill_h > 0:
+        r = int(255 * risk)
+        g = int(255 * (1 - risk))
+        cv2.rectangle(img, (x, y + h - fill_h), (x + w, y + h), (0, g, r), -1)
+    # Label
+    cv2.putText(img, label, (x, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(img, f"{int(risk*100)}%", (x, y + h + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+
+
 def annotate_frame(
     image: np.ndarray,
     frame_result: dict,
     lidar_dets: List[LiDARDetection],
 ) -> np.ndarray:
-    """Draw PRISM outputs onto the camera frame."""
+    """Draw impressive PRISM outputs onto the camera frame."""
+    global _vlm_text_buffer, _vlm_text_ttl
+
     out = image.copy()
     h, w = out.shape[:2]
 
-    # ── Camera detections ─────────────────────────────────────────────────────
-    for det in frame_result.get("sensory_frame", {}) and [] or []:
-        pass  # handled by SensoryVisualizer below
-
-    if frame_result["sensory_frame"] is not None:
-        from prism.sensory_core.core import SensoryVisualizer
-        out = SensoryVisualizer.draw_detections(out, frame_result["sensory_frame"])
-
-    # ── LiDAR cluster indicators (distance labels at bottom) ─────────────────
-    for i, det in enumerate(lidar_dets[:5]):
-        x_pos = int(w * (0.15 + i * 0.15))
-        label = f"L:{det.distance_m:.1f}m"
-        cv2.putText(out, label, (x_pos, h - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
-
-    # ── Decision banner ───────────────────────────────────────────────────────
     decision = frame_result.get("decision", "UNKNOWN")
     risk     = frame_result.get("risk", 0.0)
-    colors   = {
-        "PROCEED":         (0, 200, 0),
-        "DECELERATE":      (0, 165, 255),
-        "STOP":            (0, 0, 220),
-        "EMERGENCY_BRAKE": (0, 0, 255),
-        "YIELD":           (0, 200, 200),
-        "UNKNOWN":         (128, 128, 128),
-    }
-    color = colors.get(decision, (128, 128, 128))
-    cv2.rectangle(out, (0, 0), (w, 32), (20, 20, 20), -1)
-    cv2.putText(out, f"{decision}  risk={risk:.2f}", (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+    speed    = frame_result.get("speed_mps", 0.0)
+    vlm_fired = frame_result.get("vlm_fired", False)
+    vlm_summary = frame_result.get("vlm_summary", "")
 
-    # ── HUD ───────────────────────────────────────────────────────────────────
-    hud = [
-        f"Frame: {frame_result['frame_idx']}",
-        f"Cam: {frame_result['n_cam_dets']}  LiDAR: {frame_result['n_lidar_dets']}",
-        f"Latency: {frame_result['latency_ms']:.0f}ms",
-        f"VLM: {'ON' if frame_result['vlm_fired'] else 'off'}",
+    # ── Decision color map ────────────────────────────────────────────────────
+    DEC_COLORS = {
+        "CLEAR":     (30,  200, 30),
+        "EASE":      (60,  220, 100),
+        "MONITOR":   (180, 180, 30),
+        "SLOW":      (30,  180, 220),
+        "YIELD":     (30,  160, 255),
+        "CAUTION":   (30,  120, 255),
+        "STOP":      (30,   30, 220),
+        "EMERGENCY": (0,    0,  255),
+        "UNKNOWN":   (100, 100, 100),
+    }
+    dec_color = DEC_COLORS.get(decision, (100, 100, 100))
+
+    # ── Colored border strip at top ───────────────────────────────────────────
+    _blend_rect(out, 0, 0, w, 52, dec_color, alpha=0.75)
+
+    # Decision label (large)
+    cv2.putText(out, decision, (14, 38),
+                cv2.FONT_HERSHEY_DUPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Speed target
+    spd_kmh = speed * 3.6
+    cv2.putText(out, f"{spd_kmh:.0f} km/h", (w - 130, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # ── Camera detections (bounding boxes + labels) ───────────────────────────
+    sf = frame_result.get("sensory_frame")
+    if sf is not None and hasattr(sf, "detections"):
+        for det in sf.detections:
+            if det.camera_name == "lidar":
+                continue   # skip synthetic LiDAR-only blobs
+            b = det.bbox
+            x1, y1, x2, y2 = int(b.x1), int(b.y1), int(b.x2), int(b.y2)
+            cls = b.class_name or "obj"
+            dist = det.depth_estimate
+            dist_str = f"{dist:.1f}m" if dist is not None else ""
+            label = f"{cls} {dist_str}".strip()
+            conf  = b.confidence
+
+            # Box color: red closer, green further
+            if dist is not None and dist < 5.0:
+                box_col = (0, 60, 255)
+            elif dist is not None and dist < 15.0:
+                box_col = (0, 165, 255)
+            else:
+                box_col = (50, 220, 50)
+
+            cv2.rectangle(out, (x1, y1), (x2, y2), box_col, 2)
+            # Label background
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            _blend_rect(out, x1, max(0, y1 - th - 8), x1 + tw + 6, y1, (20, 20, 20), 0.7)
+            cv2.putText(out, label, (x1 + 3, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # ── LiDAR cluster dots along bottom ──────────────────────────────────────
+    _blend_rect(out, 0, h - 36, w, h, (10, 10, 10), 0.6)
+    shown = sorted(lidar_dets, key=lambda d: d.distance_m)[:8]
+    for i, ld in enumerate(shown):
+        x_pos = 12 + i * (w // 9)
+        dist_ratio = min(ld.distance_m / 40.0, 1.0)
+        dot_r = int(255 * (1 - dist_ratio))
+        dot_g = int(255 * dist_ratio)
+        dot_col = (0, dot_g, dot_r)
+        cv2.circle(out, (x_pos + 16, h - 18), 5, dot_col, -1)
+        cv2.putText(out, f"{ld.distance_m:.0f}m", (x_pos, h - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── Risk bar (right edge) ─────────────────────────────────────────────────
+    bar_w = 18
+    bar_h = h - 100
+    _draw_risk_bar(out, w - bar_w - 10, 60, bar_w, bar_h, risk)
+
+    # ── HUD (bottom-left) ─────────────────────────────────────────────────────
+    hud_lines = [
+        f"Frame  {frame_result['frame_idx']:05d}",
+        f"Cam    {frame_result['n_cam_dets']}  LiDAR  {frame_result['n_lidar_dets']}",
+        f"Risk   {risk:.0%}",
+        f"Lat    {frame_result['latency_ms']:.0f} ms",
     ]
-    for i, line in enumerate(hud):
-        cv2.putText(out, line, (10, 55 + i * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    for i, line in enumerate(hud_lines):
+        cv2.putText(out, line, (10, h - 42 - (len(hud_lines) - 1 - i) * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── VLM text overlay ──────────────────────────────────────────────────────
+    if vlm_fired and vlm_summary:
+        _vlm_text_buffer = vlm_summary
+        _vlm_text_ttl    = VLM_TEXT_HOLD_FRAMES
+
+    if _vlm_text_ttl > 0:
+        _vlm_text_ttl -= 1
+        alpha = min(1.0, _vlm_text_ttl / 15.0)   # fade out last 15 frames
+
+        box_y1 = 58
+        box_y2 = 110
+        _blend_rect(out, 0, box_y1, w, box_y2, (10, 10, 60), 0.75)
+
+        # PRISM badge
+        cv2.putText(out, "PRISM AI", (10, box_y1 + 18),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.5, (100, 200, 255), 1, cv2.LINE_AA)
+
+        # Word-wrap the VLM summary to fit the frame width
+        words   = _vlm_text_buffer.split()
+        lines   = []
+        cur     = ""
+        for word in words:
+            test = (cur + " " + word).strip()
+            (tw, _), _ = cv2.getTextSize(test, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+            if tw > w - 110:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = test
+        if cur:
+            lines.append(cur)
+
+        for li, line in enumerate(lines[:2]):
+            y_pos = box_y1 + 18 + (li + 1) * 20
+            if y_pos < box_y2 - 4:
+                cv2.putText(out, line, (90, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                            (255, 255, 200), 1, cv2.LINE_AA)
+
+    # ── PRISM watermark ───────────────────────────────────────────────────────
+    cv2.putText(out, "PRISM", (w // 2 - 28, h - 6),
+                cv2.FONT_HERSHEY_DUPLEX, 0.45, (80, 80, 80), 1, cv2.LINE_AA)
 
     return out
 
@@ -371,6 +498,7 @@ def evaluate_bag(
     vlm_enabled: bool    = True,
     max_frames: int      = 0,
     save_video: bool     = False,
+    live_display: bool   = False,
     output_dir: Path     = None,
 ) -> dict:
     """Run PRISM pipeline on a single bag. Returns results dict."""
@@ -491,19 +619,28 @@ def evaluate_bag(
                         "risk":      result["risk"],
                     })
 
-                # Video output
-                if save_video and image is not None:
+                # Video / live display output
+                if (save_video or live_display) and image is not None:
                     annotated = annotate_frame(image, result, lidar_dets)
-                    if video_writer is None:
-                        h, w = annotated.shape[:2]
-                        if output_dir:
-                            vid_path = output_dir / f"ros2_eval_{bag_name}.mp4"
-                        else:
-                            vid_path = Path(f"/tmp/ros2_eval_{bag_name}.mp4")
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        video_writer = cv2.VideoWriter(str(vid_path), fourcc, 10, (w, h))
-                        logger.info(f"Video writer opened: {vid_path}")
-                    video_writer.write(annotated)
+
+                    if save_video:
+                        if video_writer is None:
+                            fh, fw = annotated.shape[:2]
+                            if output_dir:
+                                vid_path = output_dir / f"ros2_eval_{bag_name}.mp4"
+                            else:
+                                vid_path = Path(f"/tmp/ros2_eval_{bag_name}.mp4")
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            video_writer = cv2.VideoWriter(str(vid_path), fourcc, 12, (fw, fh))
+                            logger.info(f"Video writer opened: {vid_path}")
+                        video_writer.write(annotated)
+
+                    if live_display:
+                        cv2.imshow("PRISM — Real-Time Perception", annotated)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord("q"):
+                            logger.info("Live display: user pressed Q — stopping")
+                            break
 
                 frame_count += 1
 
@@ -521,6 +658,8 @@ def evaluate_bag(
     finally:
         if video_writer is not None:
             video_writer.release()
+        if live_display:
+            cv2.destroyAllWindows()
 
     if frame_count == 0:
         logger.error("No frames processed — check bag path and topic names")
@@ -584,6 +723,7 @@ def main():
     parser.add_argument("--no-vlm",      action="store_true", help="Disable VLM (ablation)")
     parser.add_argument("--max-frames",  type=int, default=0, help="Limit frames (0=all)")
     parser.add_argument("--save-video",  action="store_true", help="Write annotated video")
+    parser.add_argument("--live",        action="store_true", help="Show live OpenCV display window")
     parser.add_argument("--output-dir",  type=str, default=None, help="Override output dir")
     args = parser.parse_args()
 
@@ -613,12 +753,13 @@ def main():
             continue
 
         results = evaluate_bag(
-            bag_path    = bag_path,
-            cfg         = cfg,
-            vlm_enabled = not args.no_vlm,
-            max_frames  = args.max_frames,
-            save_video  = args.save_video,
-            output_dir  = output_dir,
+            bag_path     = bag_path,
+            cfg          = cfg,
+            vlm_enabled  = not args.no_vlm,
+            max_frames   = args.max_frames,
+            save_video   = args.save_video,
+            live_display = args.live,
+            output_dir   = output_dir,
         )
         all_results[bag_name] = results
 
