@@ -499,6 +499,7 @@ def evaluate_bag(
     max_frames: int      = 0,
     save_video: bool     = False,
     live_display: bool   = False,
+    dashboard: bool      = False,
     output_dir: Path     = None,
 ) -> dict:
     """Run PRISM pipeline on a single bag. Returns results dict."""
@@ -621,7 +622,15 @@ def evaluate_bag(
 
                 # Video / live display output
                 if (save_video or live_display) and image is not None:
-                    annotated = annotate_frame(image, result, lidar_dets)
+                    if dashboard:
+                        from prism.viz.dashboard import render_dashboard
+                        annotated = render_dashboard(
+                            image, result, lidar_dets,
+                            vlm_summary=result.get("vlm_summary", ""),
+                            vlm_fired=result.get("vlm_fired", False),
+                        )
+                    else:
+                        annotated = annotate_frame(image, result, lidar_dets)
 
                     if save_video:
                         if video_writer is None:
@@ -724,6 +733,7 @@ def main():
     parser.add_argument("--max-frames",  type=int, default=0, help="Limit frames (0=all)")
     parser.add_argument("--save-video",  action="store_true", help="Write annotated video")
     parser.add_argument("--live",        action="store_true", help="Show live OpenCV display window")
+    parser.add_argument("--dashboard",   action="store_true", help="Tesla-style HUD with lane lines, BEV, gauges")
     parser.add_argument("--output-dir",  type=str, default=None, help="Override output dir")
     args = parser.parse_args()
 
@@ -759,6 +769,7 @@ def main():
             max_frames   = args.max_frames,
             save_video   = args.save_video,
             live_display = args.live,
+            dashboard    = args.dashboard,
             output_dir   = output_dir,
         )
         all_results[bag_name] = results
