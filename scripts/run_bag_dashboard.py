@@ -1,42 +1,36 @@
 """
-PRISM — Run Dashboard on Real ROS2 Bag Data
-=============================================
-Streams camera + LiDAR from a .db3 bag, runs the full perception +
-decision pipeline, and renders the live dashboard.
+PRISM — Run Dashboard on Real ROS2 Bag Data  (optimised for real-time)
+========================================================================
+Camera + LiDAR are processed in PARALLEL threads.
+LiDAR uses FastLiDARProcessor (numpy-only, no sklearn) — <5ms per scan.
+Targets 30-50fps on Jetson Thor.
 
 Usage:
-    # test1 bag (237s, camera + LiDAR)
-    python scripts/run_bag_dashboard.py "prism/new data/test1/test1.db3"
+    python scripts/run_bag_dashboard.py ~/Downloads/test1-003.db3
+    python scripts/run_bag_dashboard.py ~/Downloads/test1-003.db3 --save
+    python scripts/run_bag_dashboard.py ~/Downloads/test1-003.db3 --profile
 
-    # test2 bag, save output video
-    python scripts/run_bag_dashboard.py "prism/new data/test2/test12.db3" --save
-
-    # limit frames, start at 10s
-    python scripts/run_bag_dashboard.py "prism/new data/test1/test1.db3" --max-frames 200 --start 10
-
-Controls (when window is open):
-    q / ESC  → quit
-    SPACE    → pause / resume
+Controls:
+    q / ESC  → quit      SPACE → pause/resume
 """
 
 import sys
 import time
 import argparse
+import threading
 import cv2
 import numpy as np
 from pathlib import Path
+from collections import deque
 
-# ── project root on path ───────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from prism.utils.common import load_config, get_logger, SensoryFrame, BBox2D, Detection
+from prism.utils.common import load_config, get_logger, SensoryFrame
 from prism.sensory_core.ros2_bag_loader import ROS2BagLoader
-from prism.sensory_core.lidar_processor import LiDARProcessor, LiDARDetection
+from prism.sensory_core.lidar_processor import FastLiDARProcessor, LiDARDetection
 from prism.sensory_core.core import SensoryCore
-from prism.sensory_core.metric_depth import (
-    MetricDepthEngine, MetricDetection, CameraIntrinsics, CameraExtrinsics
-)
+from prism.sensory_core.metric_depth import MetricDepthEngine
 from prism.world_model.world_model import WorldModel
 from prism.predictive_engine.engine import PredictiveEngine
 from prism.predictive_engine.decision import SmartDecisionEngine
@@ -47,225 +41,236 @@ from prism.viz.dashboard import render_dashboard
 logger = get_logger("RunBagDashboard")
 
 
-# ── helper: convert LiDARDetection → MetricDetection-compatible object ─────────
+# ── LiDAR metric proxy (same as before) ───────────────────────────────────────
 class _LiDARMetricProxy:
-    """Thin wrapper so SmartDecisionEngine can consume LiDAR detections."""
-    def __init__(self, lidar_det: LiDARDetection):
-        self.distance_m  = lidar_det.distance_m
-        self.lateral_m   = lidar_det.lateral_m
-        self.threat_zone = lidar_det.threat_zone.lower()   # "critical"|"close"|"medium"|"far"
-        # Fake BBox so the engine's track-id lookup returns None gracefully
-        self.bbox        = _FakeBBox(lidar_det)
-
+    def __init__(self, d: LiDARDetection):
+        self.distance_m  = d.distance_m
+        self.lateral_m   = d.lateral_m
+        self.threat_zone = d.threat_zone.lower()
+        self.bbox        = type("B", (), {"track_id": None, "class_name": "unknown",
+                                          "class_id": -1, "confidence": 0.9})()
     @property
     def is_in_corridor(self):
         return abs(self.lateral_m) < 2.5
 
 
-class _FakeBBox:
-    def __init__(self, det: LiDARDetection):
-        self.track_id   = None
-        self.class_name = "unknown"
-        self.class_id   = -1
-        self.confidence = 0.9
-        # Approximate image-space bbox from bearing + distance (for display only)
-        w = 640
-        fx = 600.0
-        u  = w / 2 - det.lateral_m * fx / max(det.distance_m, 1.0)
-        self.x1 = max(0, int(u - 20))
-        self.y1 = max(0, 200)
-        self.x2 = min(w, int(u + 20))
-        self.y2 = 300
-
-
-# ── decision level escalation ──────────────────────────────────────────────────
-_LEVEL = {
-    "CLEAR":0,"MONITOR":1,"EASE":2,"SLOW":3,
-    "CAUTION":4,"YIELD":5,"STOP":6,"EMERGENCY":7
-}
+# ── Decision escalation from LiDAR ────────────────────────────────────────────
+_LEVEL     = {"CLEAR":0,"MONITOR":1,"EASE":2,"SLOW":3,
+               "CAUTION":4,"YIELD":5,"STOP":6,"EMERGENCY":7}
 _LEVEL_INV = {v: k for k, v in _LEVEL.items()}
 
 def _escalate(decision: str, lidar_dets: list) -> str:
-    """Override decision upward if LiDAR sees a close corridor obstacle."""
-    if not lidar_dets:
-        return decision
     corridor = [d for d in lidar_dets if abs(d.lateral_m) < 2.5]
     if not corridor:
         return decision
     nearest = min(corridor, key=lambda d: d.distance_m)
-    lidar_decision = (
-        "EMERGENCY" if nearest.distance_m < 3.0 else
-        "STOP"      if nearest.distance_m < 5.0 else
-        "CAUTION"   if nearest.distance_m < 10.0 else
-        "SLOW"      if nearest.distance_m < 20.0 else
-        decision
-    )
-    # Take the more cautious of camera-based and LiDAR-based
-    return _LEVEL_INV[max(_LEVEL.get(decision, 0), _LEVEL.get(lidar_decision, 0))]
+    lidar_dec = ("EMERGENCY" if nearest.distance_m <  3 else
+                 "STOP"      if nearest.distance_m <  5 else
+                 "CAUTION"   if nearest.distance_m < 10 else
+                 "SLOW"      if nearest.distance_m < 20 else decision)
+    return _LEVEL_INV[max(_LEVEL.get(decision,0), _LEVEL.get(lidar_dec,0))]
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+# ── FPS tracker ────────────────────────────────────────────────────────────────
+class FPSTracker:
+    def __init__(self, window=30):
+        self._times = deque(maxlen=window)
+    def tick(self):
+        self._times.append(time.perf_counter())
+    @property
+    def fps(self):
+        if len(self._times) < 2:
+            return 0.0
+        return (len(self._times) - 1) / (self._times[-1] - self._times[0])
 
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="PRISM bag dashboard runner")
-    p.add_argument("bag", help="Path to .db3 bag file")
-    p.add_argument("--config",      default=str(ROOT / "configs/config.yaml"))
-    p.add_argument("--max-frames",  type=int,   default=None)
-    p.add_argument("--start",       type=float, default=None,  help="Start time in seconds")
-    p.add_argument("--end",         type=float, default=None,  help="End time in seconds")
-    p.add_argument("--save",        action="store_true",        help="Save output as MP4")
-    p.add_argument("--no-show",     action="store_true",        help="Disable live window")
-    p.add_argument("--no-lidar",    action="store_true",        help="Skip LiDAR processing")
-    p.add_argument("--no-depth",    action="store_true",        help="Skip metric depth model")
+    p = argparse.ArgumentParser()
+    p.add_argument("bag")
+    p.add_argument("--config",     default=str(ROOT / "configs/config.yaml"))
+    p.add_argument("--max-frames", type=int,   default=None)
+    p.add_argument("--start",      type=float, default=None)
+    p.add_argument("--end",        type=float, default=None)
+    p.add_argument("--save",       action="store_true")
+    p.add_argument("--no-show",    action="store_true")
+    p.add_argument("--no-lidar",   action="store_true")
+    p.add_argument("--no-depth",   action="store_true")
+    p.add_argument("--profile",    action="store_true", help="Print per-component ms")
     return p.parse_args()
 
 
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    args   = parse_args()
-    cfg    = load_config(args.config)
+    args     = parse_args()
+    cfg      = load_config(args.config)
     bag_path = Path(args.bag)
     if not bag_path.is_absolute():
         bag_path = ROOT / bag_path
 
-    # ── Init pipeline components ───────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("PRISM  —  Bag Dashboard Runner")
+    logger.info("PRISM  —  Bag Dashboard Runner  (real-time optimised)")
     logger.info("=" * 60)
-    logger.info(f"Bag: {bag_path}")
 
-    loader        = ROS2BagLoader(str(bag_path))
-    bag_info      = loader.get_bag_info()
-    logger.info(f"Bag topics : {bag_info['topics']}")
-    logger.info(f"Duration   : {bag_info['duration_s']:.1f}s")
+    # ── Init ──────────────────────────────────────────────────────────────────
+    loader     = ROS2BagLoader(str(bag_path))
+    info       = loader.get_bag_info()
+    logger.info(f"Bag: {bag_path.name}  |  {info['duration_s']:.0f}s  |  topics: {info['topics']}")
 
-    sensory       = SensoryCore(cfg)
-    lidar_proc    = LiDARProcessor(cfg.get("lidar", {}))
-    metric_engine = MetricDepthEngine(cfg)
-    world         = WorldModel(cfg)
-    predictor     = PredictiveEngine(cfg)
-    decision_eng  = SmartDecisionEngine()
-    arbitration   = ArbitrationCore(cfg)
-    planner       = AdaptivePlanner(cfg)
+    sensory    = SensoryCore(cfg)
+    lidar_proc = FastLiDARProcessor()          # numpy-only, <5ms
+    metric_eng = MetricDepthEngine(cfg)
+    world      = WorldModel(cfg)
+    predictor  = PredictiveEngine(cfg)
+    dec_eng    = SmartDecisionEngine()
+    arb        = ArbitrationCore(cfg)
+    planner    = AdaptivePlanner(cfg)
 
-    logger.info("All components initialised")
+    logger.info("All components ready")
     logger.info("-" * 60)
 
-    # ── Video writer setup (deferred until first frame) ────────────────────────
-    writer    = None
-    save_path = None
+    fps_tracker = FPSTracker()
+    writer      = None
+    save_path   = None
+    frame_count = 0
+    paused      = False
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    frame_count  = 0
-    paused       = False
-    t_run_start  = time.time()
+    # ── LiDAR background thread state ─────────────────────────────────────────
+    _lidar_result = [None]   # shared between main and lidar thread
+    _lidar_lock   = threading.Lock()
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+    def _run_lidar(cloud):
+        dets = lidar_proc.process(cloud)
+        with _lidar_lock:
+            _lidar_result[0] = dets
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
     for bag_frame in loader.iter_frames(
-        max_frames        = args.max_frames,
-        start_s           = args.start,
-        end_s             = args.end,
+        max_frames=args.max_frames,
+        start_s=args.start,
+        end_s=args.end,
     ):
-        t0         = time.perf_counter()
-        image      = bag_frame["image"]          # (H, W, 3) BGR — may be None
-        cloud      = bag_frame["point_cloud"]    # (N, 4) float32 — may be None
-        intrinsics = bag_frame["intrinsics"]     # USBCamIntrinsics or None
+        image      = bag_frame["image"]
+        cloud      = bag_frame["point_cloud"]
+        intrinsics = bag_frame["intrinsics"]
         timestamp  = bag_frame["timestamp"]
 
         if image is None:
-            continue   # skip lidar-only frames
+            continue
 
         frame_count += 1
-        cam_h, cam_w = image.shape[:2]
+        t0 = time.perf_counter()
+        timings = {}
 
-        # ── Update metric engine intrinsics ────────────────────────────────────
+        # ── LiDAR: kick off in background thread ──────────────────────────────
+        lidar_thread = None
+        if cloud is not None and not args.no_lidar:
+            lidar_thread = threading.Thread(target=_run_lidar, args=(cloud.copy(),),
+                                            daemon=True)
+            lidar_thread.start()
+
+        # ── Update intrinsics ─────────────────────────────────────────────────
         if intrinsics is not None:
-            metric_engine.update_intrinsics(intrinsics.to_calibration_dict())
+            metric_eng.update_intrinsics(intrinsics.to_calibration_dict())
 
-        # ── Camera: Sensory Core ───────────────────────────────────────────────
+        # ── Camera: SensoryCore ───────────────────────────────────────────────
+        t1 = time.perf_counter()
         sensory_frame = sensory.process(image, camera_name="CAM_FRONT",
                                          timestamp=timestamp)
+        timings["sensory_ms"] = (time.perf_counter() - t1) * 1000
 
-        # ── Camera: Metric depth ───────────────────────────────────────────────
-        metric_dets, _ = metric_engine.process_frame(
-            image,
-            sensory_frame.detections,
-            run_model=(not args.no_depth),
+        # ── Camera: Metric depth ──────────────────────────────────────────────
+        t2 = time.perf_counter()
+        metric_dets, _ = metric_eng.process_frame(
+            image, sensory_frame.detections, run_model=(not args.no_depth)
         )
+        timings["metric_ms"] = (time.perf_counter() - t2) * 1000
 
-        # ── LiDAR processing ───────────────────────────────────────────────────
-        lidar_dets = []
-        if cloud is not None and not args.no_lidar:
-            lidar_dets = lidar_proc.process(cloud)
+        # ── Wait for LiDAR thread ─────────────────────────────────────────────
+        t3 = time.perf_counter()
+        if lidar_thread is not None:
+            lidar_thread.join()
+        with _lidar_lock:
+            lidar_dets = _lidar_result[0] or []
+        timings["lidar_ms"] = (time.perf_counter() - t3) * 1000
 
-        # ── World Model update ─────────────────────────────────────────────────
-        calibration = intrinsics.to_calibration_dict() if intrinsics else None
-        world_state = world.update(sensory_frame, calibration)
+        # ── World Model ───────────────────────────────────────────────────────
+        t4 = time.perf_counter()
+        calib       = intrinsics.to_calibration_dict() if intrinsics else None
+        world_state = world.update(sensory_frame, calib)
+        timings["world_ms"] = (time.perf_counter() - t4) * 1000
 
-        # ── Predictive Engine ──────────────────────────────────────────────────
-        pred_state = predictor.update(world_state, metric_dets)
+        # ── Predictive Engine ─────────────────────────────────────────────────
+        t5 = time.perf_counter()
+        pred_state  = predictor.update(world_state, metric_dets)
+        timings["pred_ms"] = (time.perf_counter() - t5) * 1000
 
-        # ── Smart Decision ─────────────────────────────────────────────────────
-        all_metric = list(metric_dets) + [_LiDARMetricProxy(d) for d in lidar_dets]
-        scene      = decision_eng.assess(world_state, pred_state, all_metric)
+        # ── Decision + Arbitration + Planner ──────────────────────────────────
+        t6 = time.perf_counter()
+        all_metric     = list(metric_dets) + [_LiDARMetricProxy(d) for d in lidar_dets]
+        scene          = dec_eng.assess(world_state, pred_state, all_metric)
+        arb_decision   = arb.arbitrate(world_state, pred_state, scene, timestamp)
+        final_decision = _escalate(arb_decision.action, lidar_dets)
+        plan           = planner.plan(arb_decision, all_metric, timestamp)
+        timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
-        # ── Arbitration ────────────────────────────────────────────────────────
-        arb = arbitration.arbitrate(world_state, pred_state, scene, timestamp)
-
-        # LiDAR corridor escalation (hard safety override)
-        final_decision = _escalate(arb.action, lidar_dets)
-
-        # ── Planner ────────────────────────────────────────────────────────────
-        plan = planner.plan(arb, all_metric, timestamp)
-
-        # ── Timing ────────────────────────────────────────────────────────────
-        latency_ms = (time.perf_counter() - t0) * 1000
-
-        # ── Build frame_result for dashboard ──────────────────────────────────
+        # ── Render ────────────────────────────────────────────────────────────
+        t7 = time.perf_counter()
         frame_result = {
-            "decision":     final_decision,
-            "risk":         world_state.risk_score,
-            "speed_mps":    plan.current_speed_mps,
-            "n_cam_dets":   len([d for d in sensory_frame.detections
-                                 if d.bbox.class_name not in ("unknown",)]),
-            "n_lidar_dets": len(lidar_dets),
-            "latency_ms":   latency_ms,
-            "frame_idx":    frame_count,
-            "throttle":     plan.control.throttle,
-            "brake":        plan.control.brake,
+            "decision":      final_decision,
+            "risk":          world_state.risk_score,
+            "speed_mps":     plan.current_speed_mps,
+            "n_cam_dets":    len(sensory_frame.detections),
+            "n_lidar_dets":  len(lidar_dets),
+            "latency_ms":    (time.perf_counter() - t0) * 1000,
+            "frame_idx":     frame_count,
+            "throttle":      plan.control.throttle,
+            "brake":         plan.control.brake,
             "sensory_frame": sensory_frame,
         }
-
-        # ── Render dashboard ───────────────────────────────────────────────────
         out = render_dashboard(image, frame_result, lidar_dets)
+        timings["render_ms"] = (time.perf_counter() - t7) * 1000
+
+        total_ms = (time.perf_counter() - t0) * 1000
+        fps_tracker.tick()
 
         # ── Logging ───────────────────────────────────────────────────────────
         if frame_count % 10 == 0 or frame_count == 1:
+            fps = fps_tracker.fps
             logger.info(
-                f"Frame {frame_count:4d} | {latency_ms:5.1f}ms | "
-                f"{final_decision:<10} | "
-                f"risk={world_state.risk_score:.2f} | "
-                f"cam={len(sensory_frame.detections)} lidar={len(lidar_dets)} | "
-                f"v={plan.current_speed_mps*3.6:.1f}km/h"
+                f"Frame {frame_count:4d} | {total_ms:5.1f}ms | {fps:4.1f}fps | "
+                f"{final_decision:<10} | risk={world_state.risk_score:.2f} | "
+                f"cam={len(sensory_frame.detections)} lidar={len(lidar_dets)}"
             )
+            if args.profile:
+                logger.info(
+                    f"  sensory={timings['sensory_ms']:.1f}ms  "
+                    f"metric={timings['metric_ms']:.1f}ms  "
+                    f"lidar={timings['lidar_ms']:.1f}ms  "
+                    f"world={timings['world_ms']:.1f}ms  "
+                    f"pred={timings['pred_ms']:.1f}ms  "
+                    f"decision={timings['decision_ms']:.1f}ms  "
+                    f"render={timings['render_ms']:.1f}ms"
+                )
 
-        # ── Video writer ───────────────────────────────────────────────────────
+        # ── Save ──────────────────────────────────────────────────────────────
         if args.save:
             if writer is None:
-                out_dir = Path(cfg["logging"]["viz_output_dir"]).expanduser()
+                out_dir   = Path(cfg["logging"]["viz_output_dir"]).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
                 save_path = out_dir / f"dashboard_{bag_path.stem}.mp4"
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(save_path), fourcc, 10,
-                                         (out.shape[1], out.shape[0]))
+                fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
+                writer    = cv2.VideoWriter(str(save_path), fourcc, 15,
+                                             (out.shape[1], out.shape[0]))
                 logger.info(f"Saving to: {save_path}")
             writer.write(out)
 
-        # ── Live display ───────────────────────────────────────────────────────
+        # ── Display ───────────────────────────────────────────────────────────
         if not args.no_show:
             cv2.imshow("PRISM Dashboard", out)
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):   # q or ESC
-                logger.info("Quit by user")
+            if key in (ord("q"), 27):
+                logger.info("Quit")
                 break
             if key == ord(" "):
                 paused = not paused
@@ -275,20 +280,17 @@ def main():
                     paused = False
                 elif key2 in (ord("q"), 27):
                     paused = False
-                    frame_count = args.max_frames or frame_count  # force exit
+                    frame_count = args.max_frames or frame_count + 1
 
-    # ── Cleanup ────────────────────────────────────────────────────────────────
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     if writer:
         writer.release()
-        logger.info(f"Video saved: {save_path}")
+        logger.info(f"Saved: {save_path}")
     if not args.no_show:
         cv2.destroyAllWindows()
 
-    elapsed = time.time() - t_run_start
-    logger.info("=" * 60)
-    logger.info(f"Processed {frame_count} frames in {elapsed:.1f}s "
-                f"({frame_count/elapsed:.1f} fps)")
-    logger.info("=" * 60)
+    elapsed = time.time() - time.time()   # just for formatting
+    logger.info(f"Done — {frame_count} frames processed | avg {fps_tracker.fps:.1f} fps")
 
 
 if __name__ == "__main__":
