@@ -61,7 +61,7 @@ print(f"  avg={np.mean(times):.0f}ms  min={np.min(times):.0f}ms  max={np.max(tim
 
 # ── 3. Optical flow ────────────────────────────────────────────────────────────
 print("\n" + "=" * 50)
-print("TEST 3: Farneback optical flow (CPU)")
+print("TEST 3a: Raw Farneback at FULL resolution (1920x1080)")
 gray_prev = cv2.cvtColor(frames[0]["image"], cv2.COLOR_BGR2GRAY)
 times = []
 for f in frames[1:N_FRAMES]:
@@ -71,6 +71,17 @@ for f in frames[1:N_FRAMES]:
                                   0.5, 3, 15, 3, 5, 1.2, 0)
     times.append((time.perf_counter() - t) * 1000)
     gray_prev = gray
+print(f"  avg={np.mean(times):.0f}ms  min={np.min(times):.0f}ms  max={np.max(times):.0f}ms")
+
+print("\nTEST 3b: OpticalFlowEstimator (fixed — runs at 320x180, upsamples)")
+from prism.sensory_core.core import OpticalFlowEstimator
+flow_est = OpticalFlowEstimator()
+flow_est.compute(frames[0]["image"])  # init prev frame
+times = []
+for f in frames[1:N_FRAMES]:
+    t = time.perf_counter()
+    flow_est.compute(f["image"])
+    times.append((time.perf_counter() - t) * 1000)
 print(f"  avg={np.mean(times):.0f}ms  min={np.min(times):.0f}ms  max={np.max(times):.0f}ms")
 
 # ── 4. LiDAR fast clustering ──────────────────────────────────────────────────
