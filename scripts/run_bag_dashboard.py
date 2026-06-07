@@ -248,7 +248,8 @@ def main():
         out = render_dashboard(image, frame_result, lidar_dets,
                                trajectory=trajectory,
                                intrinsics=last_intrinsics,
-                               optical_flow=sensory_frame.optical_flow)
+                               optical_flow=sensory_frame.optical_flow,
+                               metric_dets=metric_dets)
         timings["render_ms"] = (time.perf_counter() - t7) * 1000
 
         total_ms = (time.perf_counter() - t0) * 1000

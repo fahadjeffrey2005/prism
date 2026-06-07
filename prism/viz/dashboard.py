@@ -174,7 +174,8 @@ def draw_spatial_panel(panel: np.ndarray,
                        lidar_dets: list,
                        yolo_dets: list,
                        flow_steer: float,
-                       speed_mps: float):
+                       speed_mps: float,
+                       metric_dets: list = None):
     """
     Forward-only top-down VLAM spatial view.
     Shows PLANNED path ahead + real-time obstacles.
@@ -227,51 +228,57 @@ def draw_spatial_panel(panel: np.ndarray,
         cv2.line(panel, w2p(dists[i],lat_c),
                  w2p(dists[min(i+1,len(dists)-1)],lat_c),(120,120,120),1)
 
-    # ── YOLO detections mapped to BEV via depth estimate ─────────────────
-    PERSON_CLASSES   = {"person"}
-    VEHICLE_CLASSES  = {"car","truck","bus"}
-    BIKE_CLASSES     = {"bicycle","motorcycle"}
+    # ── Colour scheme ─────────────────────────────────────────────────────
+    # RED    = persons  (dynamic, high priority)
+    # YELLOW = vehicles (dynamic, moving threats)
+    # GREEN  = stationary objects (poles, walls, LiDAR clusters)
+    COL_PERSON    = (0,   50, 230)   # red
+    COL_VEHICLE   = (0,  220, 220)   # yellow
+    COL_STATIONARY= (30, 180,  30)   # green
+    COL_BIKE      = (0,  200, 255)   # orange (semi-dynamic)
 
-    for det in yolo_dets:
-        dist = getattr(det,"depth_estimate",None)
-        if dist is None: continue
-        dist = float(dist) * 50.0   # relative depth → rough metres
-        # Only show if within believable forward range and confidence is high
-        if dist < 1.0 or dist > 25.0: continue
-        if det.bbox.confidence < 0.45: continue
-        cls = det.bbox.class_name
-        img_w  = 960
-        u_norm = (float(det.bbox.x1+det.bbox.x2)/2 / img_w) - 0.5
-        lat_m  = u_norm * dist * 0.9
-        if abs(lat_m) > 8.0: continue   # too far to the side
-        op = w2p(dist, lat_m)
-        if   cls in PERSON_CLASSES:  col = (0,0,220);    sym = "P"
-        elif cls in VEHICLE_CLASSES: col = (30,200,30);  sym = "V"
-        elif cls in BIKE_CLASSES:    col = (20,200,220); sym = "B"
-        else:                        col = (120,120,120); sym = "?"
-        cv2.circle(panel, op, 5, col, -1)
-        cv2.putText(panel, sym, (op[0]-3, op[1]+3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
+    PERSON_CLS  = {"person"}
+    VEHICLE_CLS = {"car","truck","bus"}
+    BIKE_CLS    = {"bicycle","motorcycle"}
+    SIGNAL_CLS  = {"traffic light","stop sign"}
 
-    # ── LiDAR obstacles — corridor only, filters background walls/buildings ──
-    # Only show clusters that are actually in the driving path (|lat| < 4.5m).
-    # Wider objects (side walls, parked cars far left/right) are infrastructure,
-    # not driving hazards — don't pollute the map with them.
-    CORRIDOR_LAT_M  = 4.5   # metres either side of centre to consider
-    MIN_FORWARD_M   = 1.5   # ignore anything right at the bumper
+    # ── YOLO detections via MetricDepth (accurate geometry-based positions) ──
+    # MetricDetection has real distance_m and lateral_m from camera intrinsics
+    if metric_dets:
+        for md in metric_dets:
+            dist = float(md.distance_m)
+            lat  = float(md.lateral_m)   # positive = right of vehicle
+            cls  = md.class_name
+            if dist < 1.0 or dist > 25.0:    continue
+            if abs(lat) > 8.0:               continue
+            if md.confidence < 0.40:         continue
+            op = w2p(dist, lat)   # lat positive = right = correct, no negation
+            if   cls in PERSON_CLS:   col, sym = COL_PERSON,     "P"
+            elif cls in VEHICLE_CLS:  col, sym = COL_VEHICLE,    "V"
+            elif cls in BIKE_CLS:     col, sym = COL_BIKE,       "B"
+            elif cls in SIGNAL_CLS:   col, sym = COL_STATIONARY, "S"
+            else:                     col, sym = (150,150,150),  "?"
+            cv2.circle(panel, op, 6, col, -1)
+            cv2.circle(panel, op, 6, TEXT_WHITE, 1)
+            cv2.putText(panel, sym, (op[0]-3, op[1]+3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
+
+    # ── LiDAR corridor obstacles (stationary = green) ─────────────────────
+    # lateral_m: positive = right of vehicle (matches map convention directly)
+    # No negation needed — w2p(d, lat) maps right=right correctly
+    CORRIDOR_LAT = 4.5
     for det in lidar_dets:
         d   = getattr(det, "distance_m", 0)
-        lat = getattr(det, "lateral_m",  0)
+        lat = getattr(det, "lateral_m",  0)   # positive = right
         n   = getattr(det, "n_points",   0)
-        if d <= MIN_FORWARD_M or d > view_fwd:     continue
-        if abs(lat) > CORRIDOR_LAT_M:              continue   # side wall / building
-        if n < 8:                                  continue   # too sparse = noise
-        op  = w2p(d, -lat)
-        t   = getattr(det, "threat_zone", "FAR").upper()
-        col = ((0,0,200)   if t=="CRITICAL" else
-               (0,80,220)  if t=="CLOSE"    else
-               (0,150,200) if t=="MEDIUM"   else (0,180,160))
-        cv2.rectangle(panel,(op[0]-4,op[1]-5),(op[0]+4,op[1]+1),col,-1)
+        if d <= 1.5 or d > view_fwd:  continue
+        if abs(lat) > CORRIDOR_LAT:   continue
+        if n < 8:                     continue
+        op  = w2p(d, lat)             # correct: right stays right
+        cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
+                      COL_STATIONARY,-1)
+        cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
+                      TEXT_WHITE,1)
 
     # ── Ego vehicle ───────────────────────────────────────────────────────
     cv2.rectangle(panel,(ex-5,ey-12),(ex+5,ey),ACCENT_GREEN,-1)
@@ -280,14 +287,16 @@ def draw_spatial_panel(panel: np.ndarray,
     cv2.arrowedLine(panel,(ex,ey-12),(ex+hdiff,ey-26),TEXT_WHITE,1,tipLength=0.4)
 
     # ── Legend ────────────────────────────────────────────────────────────
-    for i,(sym,col,lbl) in enumerate([
-        ("P",(0,0,220),"Person"),
-        ("V",(30,200,30),"Vehicle"),
-        ("■",(0,150,200),"LiDAR"),
+    for i,(sym,col) in enumerate([
+        ("P", COL_PERSON),
+        ("V", COL_VEHICLE),
+        ("■", COL_STATIONARY),
+        ("B", COL_BIKE),
     ]):
-        lx = 4 + i*38
-        ly = h-5
-        cv2.putText(panel,sym,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,0.22,col,1)
+        lx = 4 + i*30
+        ly = h - 5
+        cv2.putText(panel, sym, (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, col, 1)
 
     cv2.rectangle(panel,(0,0),(w-1,h-1),(45,65,45),1)
 
@@ -502,6 +511,7 @@ def render_dashboard(image: np.ndarray,
                      intrinsics = None,
                      cam_h: float = 1.0,
                      optical_flow: np.ndarray = None,
+                     metric_dets: list = None,
                      panel_frac: float = SIDEBAR_FRAC,
                      vlm_summary: str  = "",
                      vlm_fired: bool   = False) -> np.ndarray:
@@ -633,7 +643,8 @@ def render_dashboard(image: np.ndarray,
     sa_h  = int(cam_h_px * 0.42)
     _putc(sb,"SPATIAL AWARENESS",sb_w//2,sa_lh-3,0.30,TEXT_DIM)
     sa_panel = sb[sa_lh:sa_h, pad:sb_w-pad].copy()
-    draw_spatial_panel(sa_panel, lidar_dets, yolo_dets, flow_steer, speed_mps)
+    draw_spatial_panel(sa_panel, lidar_dets, yolo_dets,
+                       flow_steer, speed_mps, metric_dets=metric_dets)
     sb[sa_lh:sa_h, pad:sb_w-pad] = sa_panel
     cv2.line(sb,(0,sa_h),(sb_w,sa_h),div,1)
     y = sa_h
