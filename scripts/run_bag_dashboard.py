@@ -108,6 +108,10 @@ def main():
     if not bag_path.is_absolute():
         bag_path = ROOT / bag_path
 
+    # Kill SensoryCore depth when --no-depth is set
+    if args.no_depth:
+        cfg.setdefault("sensory_core", {}).setdefault("sampling", {})["depth_fps"] = 0
+
     logger.info("=" * 60)
     logger.info("PRISM  —  Bag Dashboard Runner  (real-time optimised)")
     logger.info("=" * 60)
@@ -235,7 +239,7 @@ def main():
         fps_tracker.tick()
 
         # ── Logging ───────────────────────────────────────────────────────────
-        if frame_count % 10 == 0 or frame_count == 1:
+        if frame_count % 5 == 0 or frame_count == 1:
             fps = fps_tracker.fps
             logger.info(
                 f"Frame {frame_count:4d} | {total_ms:5.1f}ms | {fps:4.1f}fps | "
@@ -244,13 +248,14 @@ def main():
             )
             if args.profile:
                 logger.info(
-                    f"  sensory={timings['sensory_ms']:.1f}ms  "
-                    f"metric={timings['metric_ms']:.1f}ms  "
-                    f"lidar={timings['lidar_ms']:.1f}ms  "
-                    f"world={timings['world_ms']:.1f}ms  "
-                    f"pred={timings['pred_ms']:.1f}ms  "
-                    f"decision={timings['decision_ms']:.1f}ms  "
-                    f"render={timings['render_ms']:.1f}ms"
+                    f"  [PROFILE] sensory={timings['sensory_ms']:.0f}ms "
+                    f"metric={timings['metric_ms']:.0f}ms "
+                    f"lidar={timings['lidar_ms']:.0f}ms "
+                    f"world={timings['world_ms']:.0f}ms "
+                    f"pred={timings['pred_ms']:.0f}ms "
+                    f"decision={timings['decision_ms']:.0f}ms "
+                    f"render={timings['render_ms']:.0f}ms "
+                    f"TOTAL={total_ms:.0f}ms"
                 )
 
         # ── Save ──────────────────────────────────────────────────────────────
