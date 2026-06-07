@@ -172,122 +172,114 @@ class TrajectoryTracker:
 
 def draw_spatial_panel(panel: np.ndarray,
                        lidar_dets: list,
+                       yolo_dets: list,
                        flow_steer: float,
-                       speed_mps: float,
-                       trajectory: TrajectoryTracker):
+                       speed_mps: float):
     """
-    Single unified top-down panel showing:
-      - Planned path corridor (what PRISM would command next)
-      - LiDAR obstacles (current scan)
-      - Recent trajectory history (last MAX_SECS seconds)
-      - Ego vehicle + heading arrow
+    Forward-only top-down VLAM spatial view.
+    Shows PLANNED path ahead + real-time obstacles.
+    No trajectory history (prevents spiral accumulation).
+
+    Obstacles colour-coded by class:
+      Red   = person
+      Green = vehicle (car/truck/bus)
+      Yellow= bicycle/motorcycle
+      Blue  = LiDAR cluster (unknown class)
     """
     h, w = panel.shape[:2]
-
-    # Coordinate system: ego at bottom-centre
-    # +y = forward (up in display), +x = right (right in display)
-    # View range: ±view_lat metres lateral, 0..view_fwd forward
-    view_fwd = 30.0   # metres ahead shown
-    view_lat = 15.0   # metres left/right shown
-
-    ex, ey = w // 2, h - 22   # ego pixel position
+    view_fwd = 30.0
+    view_lat = 15.0
+    ex, ey   = w // 2, h - 22
 
     def w2p(fwd_m, lat_m):
-        px = int(np.clip(ex + lat_m / view_lat * (w // 2 - 4), 2, w - 2))
-        py = int(np.clip(ey - fwd_m / view_fwd * (h - 30), 2, h - 2))
+        px = int(np.clip(ex + lat_m / view_lat * (w//2 - 4), 2, w-2))
+        py = int(np.clip(ey - fwd_m / view_fwd * (h-30),     2, h-2))
         return px, py
 
-    # Background
-    cv2.rectangle(panel, (0, 0), (w-1, h-1), (14, 20, 14), -1)
-
-    # Grid
+    # Background + grid
+    cv2.rectangle(panel, (0,0), (w-1,h-1), (14,20,14), -1)
     for fm in range(0, int(view_fwd)+1, 5):
-        p1 = w2p(fm, -view_lat); p2 = w2p(fm, view_lat)
-        cv2.line(panel, p1, p2, (24, 36, 24), 1)
+        p1 = w2p(fm,-view_lat); p2 = w2p(fm,view_lat)
+        cv2.line(panel, p1, p2, (24,36,24), 1)
         if fm > 0 and fm % 10 == 0:
-            cv2.putText(panel, f"{fm}m", (p1[0]+2, p1[1]-2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_DIM, 1)
-    for lm in range(-int(view_lat), int(view_lat)+1, 5):
-        p1 = w2p(0, lm); p2 = w2p(view_fwd, lm)
-        cv2.line(panel, p1, p2, (24, 36, 24), 1)
+            cv2.putText(panel,f"{fm}m",(p1[0]+2,p1[1]-2),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.22,TEXT_DIM,1)
+    for lm in range(-int(view_lat),int(view_lat)+1,5):
+        cv2.line(panel, w2p(0,lm), w2p(view_fwd,lm), (24,36,24), 1)
 
-    # ── Planned path corridor (PRISM's commanded path) ─────────────────────
+    # ── Planned path corridor ─────────────────────────────────────────────
     dists = np.linspace(0, 25, 18)
     lpts, rpts = [], []
     for d in dists:
-        lat_c = flow_steer * (d ** 1.5) * 0.07
+        lat_c = flow_steer * (d**1.5) * 0.07
         lpts.append(w2p(d, lat_c - 1.4))
         rpts.append(w2p(d, lat_c + 1.4))
-
     poly = np.array(lpts + rpts[::-1], np.int32)
-    ov = panel.copy()
-    cv2.fillPoly(ov, [poly], (15, 70, 15))
+    ov   = panel.copy()
+    cv2.fillPoly(ov, [poly], (15,70,15))
     cv2.addWeighted(ov, 0.55, panel, 0.45, 0, panel)
-
     for i in range(len(lpts)-1):
-        cv2.line(panel, lpts[i], lpts[i+1], (30, 30, 180), 1)
-        cv2.line(panel, rpts[i], rpts[i+1], (30, 30, 180), 1)
-
-    # Centre dashed line
+        cv2.line(panel, lpts[i], lpts[i+1], (30,30,180), 1)
+        cv2.line(panel, rpts[i], rpts[i+1], (30,30,180), 1)
+    # Centre dashes
     for i in range(0, len(dists)-1, 2):
-        lat_c = flow_steer * (dists[i] ** 1.5) * 0.07
-        cv2.line(panel, w2p(dists[i], lat_c),
-                 w2p(dists[min(i+1, len(dists)-1)], lat_c),
-                 (120, 120, 120), 1)
+        lat_c = flow_steer * (dists[i]**1.5) * 0.07
+        cv2.line(panel, w2p(dists[i],lat_c),
+                 w2p(dists[min(i+1,len(dists)-1)],lat_c),(120,120,120),1)
 
-    # ── LiDAR obstacles ────────────────────────────────────────────────────
+    # ── YOLO detections mapped to BEV via depth estimate ─────────────────
+    PERSON_CLASSES   = {"person"}
+    VEHICLE_CLASSES  = {"car","truck","bus"}
+    BIKE_CLASSES     = {"bicycle","motorcycle"}
+
+    for det in yolo_dets:
+        dist = getattr(det,"depth_estimate",None)
+        if dist is None: continue
+        dist = float(dist) * 50.0   # relative depth → rough metres
+        if dist <= 0 or dist > view_fwd: continue
+        cls = det.bbox.class_name
+        # Lateral position from bbox centre
+        img_w  = 960   # processing width
+        u_norm = (float(det.bbox.x1+det.bbox.x2)/2 / img_w) - 0.5
+        lat_m  = u_norm * dist * 0.9
+        op = w2p(dist, lat_m)
+        if   cls in PERSON_CLASSES:  col = (0,0,220);    sym = "P"
+        elif cls in VEHICLE_CLASSES: col = (30,200,30);  sym = "V"
+        elif cls in BIKE_CLASSES:    col = (20,200,220); sym = "B"
+        else:                        col = (120,120,120); sym = "?"
+        cv2.circle(panel, op, 5, col, -1)
+        cv2.putText(panel, sym, (op[0]-3, op[1]+3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
+
+    # ── LiDAR obstacles (unknown class — show as blue squares) ───────────
     for det in lidar_dets:
-        d   = getattr(det, "distance_m", 0)
-        lat = getattr(det, "lateral_m",  0)
+        d   = getattr(det,"distance_m",0)
+        lat = getattr(det,"lateral_m", 0)
         if d <= 0 or d > view_fwd: continue
         op  = w2p(d, -lat)
-        t   = getattr(det, "threat_zone", "FAR").upper()
-        col = ((0,0,200)   if t == "CRITICAL" else
-               (0,80,220)  if t == "CLOSE"    else
-               (0,150,200) if t == "MEDIUM"   else (0,180,160))
-        cv2.rectangle(panel, (op[0]-4, op[1]-6), (op[0]+4, op[1]+2), col, -1)
+        t   = getattr(det,"threat_zone","FAR").upper()
+        col = ((0,0,200)   if t=="CRITICAL" else
+               (0,80,220)  if t=="CLOSE"    else
+               (0,150,200) if t=="MEDIUM"   else (0,180,160))
+        cv2.rectangle(panel,(op[0]-4,op[1]-5),(op[0]+4,op[1]+1),col,-1)
 
-    # ── Recent trajectory history ───────────────────────────────────────────
-    if len(trajectory.positions) > 1:
-        n     = len(trajectory.positions)
-        xs    = [p[0] for p in trajectory.positions]
-        ys    = [p[1] for p in trajectory.positions]
-        # Current ego reference: last known position
-        ox, oy = xs[-1], ys[-1]
-        oh     = trajectory.heading
+    # ── Ego vehicle ───────────────────────────────────────────────────────
+    cv2.rectangle(panel,(ex-5,ey-12),(ex+5,ey),ACCENT_GREEN,-1)
+    cv2.rectangle(panel,(ex-5,ey-12),(ex+5,ey),TEXT_WHITE,1)
+    hdiff = int(flow_steer * 14)
+    cv2.arrowedLine(panel,(ex,ey-12),(ex+hdiff,ey-26),TEXT_WHITE,1,tipLength=0.4)
 
-        pts_px = []
-        for i in range(n):
-            # Transform position relative to current ego frame
-            dx = xs[i] - ox
-            dy = ys[i] - oy
-            # Rotate so current heading = forward
-            fwd =  dx * math.sin(-oh) + dy * math.cos(-oh)
-            lat_v = dx * math.cos(-oh) - dy * math.sin(-oh)
-            # Only draw points in viewable range
-            if -view_fwd*0.5 < fwd < view_fwd and -view_lat < lat_v < view_lat:
-                pts_px.append((i, w2p(fwd, lat_v)))
-            else:
-                pts_px.append((i, None))
+    # ── Legend ────────────────────────────────────────────────────────────
+    for i,(sym,col,lbl) in enumerate([
+        ("P",(0,0,220),"Person"),
+        ("V",(30,200,30),"Vehicle"),
+        ("■",(0,150,200),"LiDAR"),
+    ]):
+        lx = 4 + i*38
+        ly = h-5
+        cv2.putText(panel,sym,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,0.22,col,1)
 
-        for i in range(n-1):
-            if pts_px[i][1] and pts_px[i+1][1]:
-                frac = i / max(n-1, 1)
-                g    = int(50 + 150 * frac)
-                cv2.line(panel, pts_px[i][1], pts_px[i+1][1],
-                         (20, g, 20), 2)
-
-    # ── Ego vehicle ────────────────────────────────────────────────────────
-    cv2.rectangle(panel, (ex-5, ey-12), (ex+5, ey), ACCENT_GREEN, -1)
-    cv2.rectangle(panel, (ex-5, ey-12), (ex+5, ey), TEXT_WHITE,   1)
-    # Heading arrow (shows commanded heading)
-    arrow_len = 14
-    hdiff = int(flow_steer * 12)
-    cv2.arrowedLine(panel, (ex, ey-12), (ex+hdiff, ey-12-arrow_len),
-                    TEXT_WHITE, 1, tipLength=0.4)
-
-    # Border
-    cv2.rectangle(panel, (0,0), (w-1, h-1), (45, 65, 45), 1)
+    cv2.rectangle(panel,(0,0),(w-1,h-1),(45,65,45),1)
 
 
 # ============================================================================
@@ -544,29 +536,42 @@ def render_dashboard(image: np.ndarray,
         cx_k     = cam_w / 2.0
         cy_k     = cam_h_px * 0.52
 
-    # ── Lane detection ────────────────────────────────────────────────────────
+    # ── Lane detection (geometry only — no Hough lines drawn) ────────────────
     cam  = image.copy()
-    left, right, poly = _lane.detect(cam)
-    lane_steer = _lane.steer(cam_w)  # for display gauge only
+    _, _, poly = _lane.detect(cam)
+    lane_steer = _lane.steer(cam_w)
 
-    # ── Ground path with FLOW steer (bends with actual vehicle motion) ────────
+    # ── Ground path with FLOW steer — smooth projection lines only ───────────
+    # Pass lane_poly=None so projection always draws the boundary lines
+    # (Hough disabled — it causes choppy/crossing artefacts on unmarked roads)
     draw_ground_path(cam, fx, fy, cx_k, cy_k,
-                     cam_h=cam_h, flow_steer=flow_steer, lane_poly=poly)
+                     cam_h=cam_h, flow_steer=flow_steer, lane_poly=None)
 
-    # Lane lines on top (single set, no duplication) ──────────────────────────
-    if poly is not None:
-        _lane.draw_lines_only(cam, left, right)
+    # ── Bounding boxes — colour-coded by class ────────────────────────────────
+    PERSON_CLS  = {"person"}
+    VEHICLE_CLS = {"car","truck","bus"}
+    BIKE_CLS    = {"bicycle","motorcycle"}
+    SIGNAL_CLS  = {"traffic light","stop sign"}
 
-    # ── Bounding boxes ────────────────────────────────────────────────────────
+    yolo_dets = []
     if sf is not None and hasattr(sf, "detections"):
         for det in sf.detections:
             if getattr(det,"camera_name","")=="lidar": continue
-            b=det.bbox
-            x1,y1,x2,y2=int(b.x1),int(b.y1),int(b.x2),int(b.y2)
-            dist=det.depth_estimate
-            lbl=f"{b.class_name}{f' {dist:.1f}m' if dist else ''}"
-            bc=((0,40,255) if (dist or 99)<6 else
-                (0,140,255) if (dist or 99)<15 else (40,200,40))
+            b    = det.bbox
+            cls  = b.class_name
+            dist = det.depth_estimate
+            yolo_dets.append(det)
+
+            x1,y1,x2,y2 = int(b.x1),int(b.y1),int(b.x2),int(b.y2)
+            lbl = f"{cls}{f' {dist:.1f}m' if dist else ''}"
+
+            # Colour by class type
+            if   cls in PERSON_CLS:   bc = (0, 50, 230)   # red
+            elif cls in VEHICLE_CLS:  bc = (40,200, 40)   # green
+            elif cls in BIKE_CLS:     bc = (20,220,220)   # yellow
+            elif cls in SIGNAL_CLS:   bc = (220,180, 20)  # cyan
+            else:                     bc = (150,150,150)
+
             cv2.rectangle(cam,(x1,y1),(x2,y2),bc,2,cv2.LINE_AA)
             (tw,th),_=cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,0.42,1)
             _blend(cam,x1,max(0,y1-th-6),x1+tw+5,y1,(10,10,10),0.72)
@@ -583,8 +588,12 @@ def render_dashboard(image: np.ndarray,
     _put(cam,"PRISM  AUTONOMOUS  PERCEPTION",8,17,0.44,TEXT_CYAN)
     _put(cam,f"FPS: {fps:.1f}  |  Speed cmd: {speed_kmh:.0f} km/h",8,36,0.36,ACCENT_GREEN)
 
-    # ── Top-centre ───────────────────────────────────────────────────────────
-    _putc(cam,f"Vehicles: {n_cam}   Persons: {n_lidar}",cam_w//2,18,0.38,TEXT_WHITE)
+    # ── Top-centre: real YOLO counts ─────────────────────────────────────────
+    n_persons  = sum(1 for d in yolo_dets if d.bbox.class_name in PERSON_CLS)
+    n_vehicles = sum(1 for d in yolo_dets
+                     if d.bbox.class_name in VEHICLE_CLS | BIKE_CLS)
+    _putc(cam,f"Vehicles: {n_vehicles}   Persons: {n_persons}",
+          cam_w//2,18,0.38,TEXT_WHITE)
 
     # ── VLM strip ────────────────────────────────────────────────────────────
     if vlm_fired and vlm_summary:
@@ -614,8 +623,7 @@ def render_dashboard(image: np.ndarray,
     sa_h  = int(cam_h_px * 0.42)
     _putc(sb,"SPATIAL AWARENESS",sb_w//2,sa_lh-3,0.30,TEXT_DIM)
     sa_panel = sb[sa_lh:sa_h, pad:sb_w-pad].copy()
-    draw_spatial_panel(sa_panel, lidar_dets, flow_steer, speed_mps,
-                       trajectory if trajectory else TrajectoryTracker(1))
+    draw_spatial_panel(sa_panel, lidar_dets, yolo_dets, flow_steer, speed_mps)
     sb[sa_lh:sa_h, pad:sb_w-pad] = sa_panel
     cv2.line(sb,(0,sa_h),(sb_w,sa_h),div,1)
     y = sa_h
