@@ -236,12 +236,14 @@ def draw_spatial_panel(panel: np.ndarray,
         dist = getattr(det,"depth_estimate",None)
         if dist is None: continue
         dist = float(dist) * 50.0   # relative depth → rough metres
-        if dist <= 0 or dist > view_fwd: continue
+        # Only show if within believable forward range and confidence is high
+        if dist < 1.0 or dist > 25.0: continue
+        if det.bbox.confidence < 0.45: continue
         cls = det.bbox.class_name
-        # Lateral position from bbox centre
-        img_w  = 960   # processing width
+        img_w  = 960
         u_norm = (float(det.bbox.x1+det.bbox.x2)/2 / img_w) - 0.5
         lat_m  = u_norm * dist * 0.9
+        if abs(lat_m) > 8.0: continue   # too far to the side
         op = w2p(dist, lat_m)
         if   cls in PERSON_CLASSES:  col = (0,0,220);    sym = "P"
         elif cls in VEHICLE_CLASSES: col = (30,200,30);  sym = "V"
@@ -251,13 +253,21 @@ def draw_spatial_panel(panel: np.ndarray,
         cv2.putText(panel, sym, (op[0]-3, op[1]+3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
 
-    # ── LiDAR obstacles (unknown class — show as blue squares) ───────────
+    # ── LiDAR obstacles — corridor only, filters background walls/buildings ──
+    # Only show clusters that are actually in the driving path (|lat| < 4.5m).
+    # Wider objects (side walls, parked cars far left/right) are infrastructure,
+    # not driving hazards — don't pollute the map with them.
+    CORRIDOR_LAT_M  = 4.5   # metres either side of centre to consider
+    MIN_FORWARD_M   = 1.5   # ignore anything right at the bumper
     for det in lidar_dets:
-        d   = getattr(det,"distance_m",0)
-        lat = getattr(det,"lateral_m", 0)
-        if d <= 0 or d > view_fwd: continue
+        d   = getattr(det, "distance_m", 0)
+        lat = getattr(det, "lateral_m",  0)
+        n   = getattr(det, "n_points",   0)
+        if d <= MIN_FORWARD_M or d > view_fwd:     continue
+        if abs(lat) > CORRIDOR_LAT_M:              continue   # side wall / building
+        if n < 8:                                  continue   # too sparse = noise
         op  = w2p(d, -lat)
-        t   = getattr(det,"threat_zone","FAR").upper()
+        t   = getattr(det, "threat_zone", "FAR").upper()
         col = ((0,0,200)   if t=="CRITICAL" else
                (0,80,220)  if t=="CLOSE"    else
                (0,150,200) if t=="MEDIUM"   else (0,180,160))
