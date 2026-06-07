@@ -230,12 +230,7 @@ def main():
         plan           = planner.plan(arb_decision, all_metric, timestamp)
         timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
-        # ── Trajectory update ─────────────────────────────────────────────────
-        trajectory.update(plan.current_speed_mps,
-                          arb_decision.speed_factor - 0.5,  # crude steer proxy
-                          timestamp)
-
-        # ── Render ────────────────────────────────────────────────────────────
+        # ── Render (trajectory.update called inside using lane_steer) ───────────
         t7 = time.perf_counter()
         frame_result = {
             "decision":      final_decision,
@@ -248,6 +243,7 @@ def main():
             "throttle":      plan.control.throttle,
             "brake":         plan.control.brake,
             "sensory_frame": sensory_frame,
+            "timestamp":     timestamp,
         }
         out = render_dashboard(image, frame_result, lidar_dets,
                                trajectory=trajectory,
