@@ -97,6 +97,8 @@ def parse_args():
     p.add_argument("--no-lidar",   action="store_true")
     p.add_argument("--no-depth",   action="store_true")
     p.add_argument("--profile",    action="store_true", help="Print per-component ms")
+    p.add_argument("--width",      type=int, default=960,
+                   help="Resize camera to this width before processing (default 960)")
     return p.parse_args()
 
 
@@ -161,6 +163,13 @@ def main():
 
         if image is None:
             continue
+
+        # ── Resize to target width (keeps aspect ratio) ───────────────────────
+        orig_h, orig_w = image.shape[:2]
+        if orig_w != args.width:
+            scale = args.width / orig_w
+            new_h = int(orig_h * scale)
+            image = cv2.resize(image, (args.width, new_h), interpolation=cv2.INTER_LINEAR)
 
         frame_count += 1
         t0 = time.perf_counter()
