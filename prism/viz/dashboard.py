@@ -108,7 +108,7 @@ class FlowSteerEstimator:
 
         mean_u = float(patch_u.mean())
         # Right turn -> mean_u negative -> positive steer (right)
-        raw = float(np.clip(-mean_u / 6.0, -1.0, 1.0))
+        raw = float(np.clip(-mean_u / 10.0, -1.0, 1.0))
         self._ema = (1 - self._alpha) * self._ema + self._alpha * raw
         # Dead-band: suppress tiny jitter
         if abs(self._ema) < 0.03:
@@ -209,7 +209,7 @@ def draw_spatial_panel(panel: np.ndarray,
         cv2.line(panel, w2p(0,lm), w2p(view_fwd,lm), (24,36,24), 1)
 
     # ── Planned path corridor ─────────────────────────────────────────────
-    dists = np.linspace(0, 25, 18)
+    dists = np.array([0, 1, 2, 3, 4.5, 6, 8, 10.5, 13, 16, 20, 25])
     lpts, rpts = [], []
     for d in dists:
         lat_c = flow_steer * (d**1.5) * 0.07
@@ -249,9 +249,13 @@ def draw_spatial_panel(panel: np.ndarray,
             dist = float(md.distance_m)
             lat  = float(md.lateral_m)   # positive = right of vehicle
             cls  = md.class_name
-            if dist < 1.0 or dist > 25.0:    continue
-            if abs(lat) > 8.0:               continue
-            if md.confidence < 0.40:         continue
+            # 50.0 = geometry fallback (unreliable), filter it out
+            if dist < 1.0 or dist >= 49.0:   continue
+            # Class-specific max range: persons visible to 40m, vehicles to 35m
+            max_d = 40.0 if cls in PERSON_CLS else 35.0
+            if dist > max_d:                 continue
+            if abs(lat) > 10.0:              continue
+            if md.confidence < 0.35:         continue
             op = w2p(dist, lat)   # lat positive = right = correct, no negation
             if   cls in PERSON_CLS:   col, sym = COL_PERSON,     "P"
             elif cls in VEHICLE_CLS:  col, sym = COL_VEHICLE,    "V"
@@ -323,8 +327,10 @@ def draw_ground_path(frame: np.ndarray,
     Anchored to image bottom.
     """
     h, w = frame.shape[:2]
-    dists = np.array([0.2, 0.5, 1.0, 1.8, 3.0, 5.0, 8.0, 13.0, 20.0, 32.0])
-    corridor_w = 1.35
+    # Dense near, sparse far — gives smooth close-in curve, stable horizon
+    dists = np.array([0.2, 0.4, 0.7, 1.1, 1.6, 2.3, 3.2, 4.5,
+                      6.0, 8.0, 10.5, 14.0, 18.0, 24.0, 32.0])
+    corridor_w = 1.40
 
     lpts, rpts = [], []
     for d in dists:
