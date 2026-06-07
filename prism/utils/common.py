@@ -101,15 +101,17 @@ class FrameSampler:
         self.rates = rates
         self.frame_count = 0
         self._intervals = {}
-        base_fps = max(rates.values())
+        nonzero = [fps for fps in rates.values() if fps > 0]
+        base_fps = max(nonzero) if nonzero else 1
         for name, fps in rates.items():
-            self._intervals[name] = max(1, round(base_fps / fps))
+            # fps=0 means disabled — never schedule this component
+            self._intervals[name] = None if fps <= 0 else max(1, round(base_fps / fps))
 
     def tick(self) -> dict:
         """Call every frame. Returns dict of component -> should_run."""
         self.frame_count += 1
         return {
-            name: (self.frame_count % interval == 0)
+            name: (interval is not None and self.frame_count % interval == 0)
             for name, interval in self._intervals.items()
         }
 
