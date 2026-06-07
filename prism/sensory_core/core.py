@@ -148,7 +148,7 @@ class DepthEstimator:
                 "depth-anything/Depth-Anything-V2-Small-hf"
             ).to(self.device)
             self.model.eval()
-            logger.info("Depth estimator ready (MPS direct)")
+            logger.info(f"Depth estimator ready on {self.device}")
         except Exception as e:
             logger.warning(f"Could not load Depth Anything: {e}")
             self.model = None

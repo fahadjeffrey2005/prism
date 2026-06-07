@@ -327,7 +327,8 @@ class MetricDepthModel:
     """
 
     def __init__(self, device: str = "mps"):
-        self.device = device
+        from prism.utils.common import get_device
+        self.device = get_device(device)
         self.model = None
         self.processor = None
         self.INFERENCE_SIZE = (448, 252)
