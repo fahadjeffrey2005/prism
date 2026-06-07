@@ -36,7 +36,7 @@ from prism.predictive_engine.engine import PredictiveEngine
 from prism.predictive_engine.decision import SmartDecisionEngine
 from prism.planner.planner import AdaptivePlanner
 from prism.arbitration.core import ArbitrationCore
-from prism.viz.dashboard import render_dashboard
+from prism.viz.dashboard import render_dashboard, TrajectoryTracker
 
 logger = get_logger("RunBagDashboard")
 
@@ -136,10 +136,12 @@ def main():
     logger.info("-" * 60)
 
     fps_tracker = FPSTracker()
+    trajectory  = TrajectoryTracker(max_points=1000)
     writer      = None
     save_path   = None
     frame_count = 0
     paused      = False
+    last_intrinsics = None
 
     # ── LiDAR background thread state ─────────────────────────────────────────
     _lidar_result = [None]   # shared between main and lidar thread
@@ -185,6 +187,7 @@ def main():
         # ── Update intrinsics ─────────────────────────────────────────────────
         if intrinsics is not None:
             metric_eng.update_intrinsics(intrinsics.to_calibration_dict())
+            last_intrinsics = intrinsics
 
         # ── Camera: SensoryCore ───────────────────────────────────────────────
         t1 = time.perf_counter()
@@ -227,6 +230,11 @@ def main():
         plan           = planner.plan(arb_decision, all_metric, timestamp)
         timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
+        # ── Trajectory update ─────────────────────────────────────────────────
+        trajectory.update(plan.current_speed_mps,
+                          arb_decision.speed_factor - 0.5,  # crude steer proxy
+                          timestamp)
+
         # ── Render ────────────────────────────────────────────────────────────
         t7 = time.perf_counter()
         frame_result = {
@@ -241,7 +249,9 @@ def main():
             "brake":         plan.control.brake,
             "sensory_frame": sensory_frame,
         }
-        out = render_dashboard(image, frame_result, lidar_dets)
+        out = render_dashboard(image, frame_result, lidar_dets,
+                               trajectory=trajectory,
+                               intrinsics=last_intrinsics)
         timings["render_ms"] = (time.perf_counter() - t7) * 1000
 
         total_ms = (time.perf_counter() - t0) * 1000
