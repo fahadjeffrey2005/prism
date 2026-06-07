@@ -20,7 +20,7 @@ sensory_core:
     confidence_threshold: 0.35
     iou_threshold: 0.45
     device: "mps"                           # Metal on M4 | "cuda" on Jetson | "cpu" fallback
-    img_size: 640
+    img_size: 416
     classes_of_interest:                    # COCO classes relevant to driving
       - 0   # person
       - 1   # bicycle

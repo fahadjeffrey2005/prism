@@ -206,9 +206,10 @@ class DepthEstimator:
 class OpticalFlowEstimator:
     """
     Dense optical flow using Farneback method.
-    Lightweight — runs every frame.
-    Catches motion before the detector even fires.
+    Computed at reduced resolution (320x180) then upsampled — ~16ms vs 566ms at 1080p.
     """
+
+    FLOW_W, FLOW_H = 320, 180   # fixed compute resolution regardless of input size
 
     def __init__(self):
         self._prev_gray = None
@@ -224,10 +225,14 @@ class OpticalFlowEstimator:
 
     def compute(self, image: np.ndarray) -> Optional[np.ndarray]:
         """
-        Compute optical flow between previous and current frame.
+        Compute optical flow at FLOW_W x FLOW_H, upsample to original resolution.
         Returns flow array (H, W, 2) or None on first frame.
         """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        orig_h, orig_w = image.shape[:2]
+
+        # Downscale for fast inference
+        small = cv2.resize(image, (self.FLOW_W, self.FLOW_H))
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
         if self._prev_gray is None:
             self._prev_gray = gray
@@ -237,7 +242,12 @@ class OpticalFlowEstimator:
             self._prev_gray, gray, None, **self._params
         )
         self._prev_gray = gray
-        return flow
+
+        # Upsample flow to original resolution and scale vectors
+        flow_up = cv2.resize(flow, (orig_w, orig_h))
+        flow_up[..., 0] *= orig_w / self.FLOW_W
+        flow_up[..., 1] *= orig_h / self.FLOW_H
+        return flow_up
 
     def get_motion_magnitude(self, flow: np.ndarray) -> np.ndarray:
         """Returns scalar motion magnitude per pixel."""
