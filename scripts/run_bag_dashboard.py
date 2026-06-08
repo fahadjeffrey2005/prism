@@ -102,11 +102,54 @@ def parse_args():
     return p.parse_args()
 
 
+# ── Bag finder ────────────────────────────────────────────────────────────────
+def _find_bag(arg: str) -> Path:
+    """
+    Locate a .db3 bag file robustly.
+    Handles spaces in paths, subdirectory layouts, and filesystem encoding issues.
+
+    Resolution order:
+      1. Exact path as given
+      2. Path resolved from cwd
+      3. os.walk search in ~/Downloads for a file with the same name
+         (bypasses any Unicode/encoding issue with the path string itself)
+    """
+    import os as _os
+
+    # Try the path directly in multiple forms
+    for candidate in (Path(arg), Path(arg).resolve(), Path.cwd() / arg):
+        try:
+            if candidate.exists() and candidate.suffix == ".db3":
+                return candidate
+        except (OSError, ValueError):
+            pass
+
+    # Walk ~/Downloads to find by filename (handles encoding issues in path)
+    target_name = Path(arg).name
+    if not target_name.endswith(".db3"):
+        logger.error(f"Argument does not end in .db3: {arg}")
+        sys.exit(1)
+
+    search_root = str(Path.home() / "Downloads")
+    logger.info(f"Direct path failed — searching {search_root} for {target_name}")
+    for root, dirs, files in _os.walk(search_root):
+        if target_name in files:
+            found = Path(root) / target_name
+            logger.info(f"Found: {found}")
+            return found
+
+    # Give up with a useful error showing what's actually on disk
+    logger.error(f"Cannot find bag: {arg!r}")
+    logger.error(f"Searched ~/Downloads for filename: {target_name!r}")
+    logger.error("Run:  find ~/Downloads -name '*.db3'  to see available bags")
+    sys.exit(1)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     args     = parse_args()
     cfg      = load_config(args.config)
-    bag_path = Path(args.bag).resolve()   # always resolves from actual cwd
+    bag_path = _find_bag(args.bag)
 
     # Kill SensoryCore depth when --no-depth is set
     if args.no_depth:

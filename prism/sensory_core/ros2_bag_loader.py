@@ -351,10 +351,8 @@ class ROS2BagLoader:
 
     def __init__(self, bag_path: str):
         self.bag_path = Path(bag_path)
-        if not self.bag_path.exists():
-            raise FileNotFoundError(f"Bag not found: {self.bag_path}")
         self._intrinsics: Optional[USBCamIntrinsics] = None
-        logger.info(f"ROS2BagLoader: {self.bag_path.name}")
+        logger.info(f"ROS2BagLoader: {self.bag_path}")
 
     def _load_topics(self, conn: sqlite3.Connection) -> dict:
         rows = conn.execute("SELECT id, name, type FROM topics").fetchall()
