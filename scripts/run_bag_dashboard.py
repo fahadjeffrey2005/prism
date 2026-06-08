@@ -108,7 +108,11 @@ def main():
     cfg      = load_config(args.config)
     bag_path = Path(args.bag)
     if not bag_path.is_absolute():
-        bag_path = ROOT / bag_path
+        # Check cwd first (so you can cd into a bag folder and pass just the filename)
+        if (Path.cwd() / bag_path).exists():
+            bag_path = Path.cwd() / bag_path
+        else:
+            bag_path = ROOT / bag_path
 
     # Kill SensoryCore depth when --no-depth is set
     if args.no_depth:
