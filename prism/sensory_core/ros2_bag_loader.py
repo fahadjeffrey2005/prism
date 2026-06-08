@@ -27,10 +27,11 @@ from prism.utils.common import get_logger
 
 logger = get_logger("ROS2BagLoader")
 
-# Preferred topic names (tried first)
+# Preferred topic names (tried in order before falling back to type detection)
 TOPIC_IMAGE   = "/usb_cam/image_raw"
 TOPIC_CAMINFO = "/usb_cam/camera_info"
 TOPIC_LIDAR   = "/velodyne_points"
+TOPIC_LIDAR2  = "/livox/lidar"          # Livox LiDAR (common on Jetson setups)
 TOPIC_IMU     = "/imu/data"
 
 # Message type substrings for auto-detection fallback
@@ -268,7 +269,8 @@ def _decode_pointcloud2(data: bytes) -> Optional[np.ndarray]:
         n_bytes    = r.u32()
         raw        = r.bytes_array(n_bytes)
 
-        field_map  = {f["name"]: f["offset"] for f in fields}
+        field_map  = {f["name"]: f["offset"]   for f in fields}
+        field_type = {f["name"]: f["datatype"] for f in fields}
         fx = field_map.get("x")
         fy = field_map.get("y")
         fz = field_map.get("z")
@@ -285,8 +287,30 @@ def _decode_pointcloud2(data: bytes) -> Optional[np.ndarray]:
         xs  = raw_arr[:, fx:fx+4].copy().view(fmt).reshape(-1)
         ys  = raw_arr[:, fy:fy+4].copy().view(fmt).reshape(-1)
         zs  = raw_arr[:, fz:fz+4].copy().view(fmt).reshape(-1)
-        ins = (raw_arr[:, fi:fi+4].copy().view(fmt).reshape(-1)
-               if fi is not None else np.zeros(n_pts, np.float32))
+
+        # Decode intensity respecting its actual ROS2 datatype:
+        #   1=INT8  2=UINT8  3=INT16  4=UINT16  5=INT32  6=UINT32
+        #   7=FLOAT32  8=FLOAT64
+        # Velodyne uses FLOAT32 (7); Livox uses UINT8 (2).
+        if fi is not None:
+            fi_type = field_type.get("intensity", 7)
+            if fi_type == 7:                    # float32
+                ins = raw_arr[:, fi:fi+4].copy().view(fmt).reshape(-1).astype(np.float32)
+            elif fi_type == 8:                  # float64
+                ins = (raw_arr[:, fi:fi+8].copy()
+                       .view(endian + "f8").reshape(-1).astype(np.float32))
+            elif fi_type in (1, 2):             # int8 / uint8  (Livox)
+                ins = raw_arr[:, fi].astype(np.float32) / 255.0
+            elif fi_type in (3, 4):             # int16 / uint16
+                ins = (raw_arr[:, fi:fi+2].copy()
+                       .view(endian + "u2").reshape(-1).astype(np.float32))
+            elif fi_type in (5, 6):             # int32 / uint32
+                ins = (raw_arr[:, fi:fi+4].copy()
+                       .view(endian + "u4").reshape(-1).astype(np.float32))
+            else:
+                ins = np.zeros(n_pts, np.float32)
+        else:
+            ins = np.zeros(n_pts, np.float32)
 
         cloud = np.stack([xs, ys, zs, ins], axis=1).astype(np.float32)
         return cloud[np.isfinite(cloud[:, :3]).all(axis=1)]
@@ -349,7 +373,10 @@ class ROS2BagLoader:
         img_id,  img_name  = _resolve_topic(topics, TOPIC_IMAGE,   _MTYPE_IMAGE,
                                             _IMAGE_PREFER, _IMAGE_REJECT)
         cam_id,  cam_name  = _resolve_topic(topics, TOPIC_CAMINFO, _MTYPE_CAMINFO)
+        # Try Velodyne name first, then Livox name, then any PointCloud2 topic
         lid_id,  lid_name  = _resolve_topic(topics, TOPIC_LIDAR,   _MTYPE_LIDAR)
+        if lid_id is None:
+            lid_id, lid_name = _resolve_topic(topics, TOPIC_LIDAR2, _MTYPE_LIDAR)
         imu_id,  imu_name  = _resolve_topic(topics, TOPIC_IMU,     _MTYPE_IMU)
 
         return {
@@ -384,6 +411,8 @@ class ROS2BagLoader:
                                             _IMAGE_PREFER, _IMAGE_REJECT)
         cam_id,  cam_name  = _resolve_topic(topics, TOPIC_CAMINFO, _MTYPE_CAMINFO)
         lid_id,  lid_name  = _resolve_topic(topics, TOPIC_LIDAR,   _MTYPE_LIDAR)
+        if lid_id is None:
+            lid_id, lid_name = _resolve_topic(topics, TOPIC_LIDAR2, _MTYPE_LIDAR)
 
         has_camera = img_id is not None
         has_lidar  = lid_id is not None

@@ -5,7 +5,7 @@ Auto-detects camera/LiDAR topics by message type — works with any topic names.
 
 Usage:
     python scripts/inspect_bags.py
-    python scripts/inspect_bags.py ~/Downloads/ROSBAG\ FILES
+    python scripts/inspect_bags.py "/home/koushik-test/Downloads/ROSBAG FILES"
 """
 
 import sys
@@ -62,9 +62,9 @@ def inspect(bag_dir: str):
     print("\n" + "=" * 100)
     print("\nTo run a bag:")
     print("  python scripts/run_bag_dashboard.py <path/to/file.db3> --no-depth --save --no-show")
-    print("\nTo run on all bags in a folder:")
-    print("  for f in ~/Downloads/ROSBAG\\ FILES/*.db3; do")
-    print("    python scripts/run_bag_dashboard.py \"$f\" --no-depth --save --no-show")
+    print("\nTo run on all bags in a folder (bash):")
+    print('  for f in ~/Downloads/"ROSBAG FILES"/*.db3; do')
+    print('    python scripts/run_bag_dashboard.py "$f" --no-depth --save --no-show')
     print("  done")
 
 
