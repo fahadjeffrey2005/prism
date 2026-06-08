@@ -5,10 +5,15 @@ Pure-Python reader for ROS2 SQLite (.db3) bag files.
 No ROS2, no rosbags, no metadata.yaml required.
 Uses SQLite + hand-written CDR decoder for the three message types we need.
 
-Supported topics:
-    /usb_cam/image_raw      → BGR numpy frames
-    /usb_cam/camera_info    → CameraIntrinsics (K matrix)
-    /velodyne_points        → (N,4) float32 numpy arrays  [x, y, z, intensity]
+Topic resolution (in priority order):
+    1. Preferred names (TOPIC_IMAGE etc.) — exact match
+    2. Auto-detection by ROS2 message type — works with any topic naming convention
+
+Detected message types:
+    sensor_msgs/msg/Image       → BGR numpy frames
+    sensor_msgs/msg/CameraInfo  → CameraIntrinsics (K matrix)
+    sensor_msgs/msg/PointCloud2 → (N,4) float32 numpy arrays [x,y,z,intensity]
+    sensor_msgs/msg/Imu         → IMU data (not currently used)
 
 Zero extra dependencies beyond numpy, opencv, sqlite3 (all already installed).
 """
@@ -17,15 +22,75 @@ import sqlite3
 import struct
 import numpy as np
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Tuple
 from prism.utils.common import get_logger
 
 logger = get_logger("ROS2BagLoader")
 
+# Preferred topic names (tried first)
 TOPIC_IMAGE   = "/usb_cam/image_raw"
 TOPIC_CAMINFO = "/usb_cam/camera_info"
 TOPIC_LIDAR   = "/velodyne_points"
 TOPIC_IMU     = "/imu/data"
+
+# Message type substrings for auto-detection fallback
+_MTYPE_IMAGE   = "sensor_msgs/msg/Image"
+_MTYPE_CAMINFO = "sensor_msgs/msg/CameraInfo"
+_MTYPE_LIDAR   = "sensor_msgs/msg/PointCloud2"
+_MTYPE_IMU     = "sensor_msgs/msg/Imu"
+
+# Image topic name fragments that indicate a colour/raw camera (not depth/IR)
+_IMAGE_PREFER  = ("color", "rgb", "raw", "image_raw", "usb_cam", "camera", "cv_cam")
+_IMAGE_REJECT  = ("depth", "depth_image", "infrared", "ir", "aligned")
+
+
+def _resolve_topic(
+    topics_dict: dict,
+    preferred_name: str,
+    msg_type_substr: str,
+    prefer_hints: tuple = (),
+    reject_hints: tuple = (),
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Find the best matching topic ID + name.
+
+    Resolution order:
+      1. Exact match on preferred_name
+      2. Type match, ranked by prefer_hints, filtered by reject_hints
+      3. First type match with no preference
+
+    topics_dict: {id: (name, type_string)}
+    """
+    # 1 — exact preferred name
+    for tid, (name, typ) in topics_dict.items():
+        if name == preferred_name:
+            return tid, name
+
+    # 2+3 — type-based fallback
+    candidates = [
+        (tid, name, typ)
+        for tid, (name, typ) in topics_dict.items()
+        if msg_type_substr.lower() in typ.lower()
+    ]
+    if not candidates:
+        return None, None
+
+    # Filter rejects
+    if reject_hints:
+        filtered = [(tid, n, t) for tid, n, t in candidates
+                    if not any(h in n.lower() for h in reject_hints)]
+        if filtered:
+            candidates = filtered
+
+    # Rank by prefer hints (first hint to match wins)
+    for hint in prefer_hints:
+        for tid, name, typ in candidates:
+            if hint in name.lower():
+                return tid, name
+
+    # Fall back to first candidate
+    tid, name, _ = candidates[0]
+    return tid, name
 
 
 # ── Minimal CDR reader ────────────────────────────────────────────────────────
@@ -274,19 +339,30 @@ class ROS2BagLoader:
     def get_bag_info(self) -> dict:
         conn = sqlite3.connect(str(self.bag_path))
         topics = self._load_topics(conn)
-        counts = conn.execute(
-            "SELECT topic_id, COUNT(*) FROM messages GROUP BY topic_id"
-        ).fetchall()
-        count_map = {tid: cnt for tid, cnt in counts}
         bounds = conn.execute(
             "SELECT MIN(timestamp), MAX(timestamp) FROM messages"
         ).fetchone()
         conn.close()
         duration_s = (bounds[1] - bounds[0]) * 1e-9 if bounds[0] else 0
+
+        # Resolve which topics we'll actually use
+        img_id,  img_name  = _resolve_topic(topics, TOPIC_IMAGE,   _MTYPE_IMAGE,
+                                            _IMAGE_PREFER, _IMAGE_REJECT)
+        cam_id,  cam_name  = _resolve_topic(topics, TOPIC_CAMINFO, _MTYPE_CAMINFO)
+        lid_id,  lid_name  = _resolve_topic(topics, TOPIC_LIDAR,   _MTYPE_LIDAR)
+        imu_id,  imu_name  = _resolve_topic(topics, TOPIC_IMU,     _MTYPE_IMU)
+
         return {
-            "path":       str(self.bag_path),
-            "duration_s": round(duration_s, 2),
-            "topics":     [name for _, (name, _) in topics.items()],
+            "path":           str(self.bag_path),
+            "duration_s":     round(duration_s, 2),
+            "topics":         [name for _, (name, _) in topics.items()],
+            "image_topic":    img_name,
+            "caminfo_topic":  cam_name,
+            "lidar_topic":    lid_name,
+            "imu_topic":      imu_name,
+            "has_camera":     img_id is not None,
+            "has_lidar":      lid_id is not None,
+            "has_imu":        imu_id is not None,
         }
 
     def iter_frames(
@@ -302,16 +378,26 @@ class ROS2BagLoader:
         """
         conn   = sqlite3.connect(str(self.bag_path))
         topics = self._load_topics(conn)
-        name_to_id = {name: tid for tid, (name, _) in topics.items()}
 
-        has_camera = TOPIC_IMAGE   in name_to_id
-        has_lidar  = TOPIC_LIDAR   in name_to_id
-        has_info   = TOPIC_CAMINFO in name_to_id
+        # Auto-resolve topics by preferred name, then by message type
+        img_id,  img_name  = _resolve_topic(topics, TOPIC_IMAGE,   _MTYPE_IMAGE,
+                                            _IMAGE_PREFER, _IMAGE_REJECT)
+        cam_id,  cam_name  = _resolve_topic(topics, TOPIC_CAMINFO, _MTYPE_CAMINFO)
+        lid_id,  lid_name  = _resolve_topic(topics, TOPIC_LIDAR,   _MTYPE_LIDAR)
 
-        logger.info(f"Topics — camera:{has_camera}  lidar:{has_lidar}  caminfo:{has_info}")
+        has_camera = img_id is not None
+        has_lidar  = lid_id is not None
+        has_info   = cam_id is not None
+
+        logger.info(
+            f"Topics — camera:{has_camera} ({img_name})  "
+            f"lidar:{has_lidar} ({lid_name})  "
+            f"caminfo:{has_info} ({cam_name})"
+        )
 
         if not has_camera and not has_lidar:
-            logger.error("Bag has neither camera nor LiDAR")
+            logger.error("Bag has neither camera nor LiDAR (checked by message type)")
+            logger.error(f"All topics: {[n for _, (n, _) in topics.items()]}")
             conn.close()
             return
 
@@ -323,10 +409,7 @@ class ROS2BagLoader:
         filter_start  = bag_start_ns + int(start_s * 1e9) if start_s else 0
         filter_end    = bag_start_ns + int(end_s   * 1e9) if end_s   else 2**63 - 1
 
-        wanted_ids = set()
-        for t in [TOPIC_IMAGE, TOPIC_CAMINFO, TOPIC_LIDAR]:
-            if t in name_to_id:
-                wanted_ids.add(name_to_id[t])
+        wanted_ids = set(i for i in [img_id, cam_id, lid_id] if i is not None)
 
         placeholders = ",".join("?" * len(wanted_ids))
         query = (
@@ -342,10 +425,12 @@ class ROS2BagLoader:
         frame_count = 0
 
         DECODERS = {
-            name_to_id.get(TOPIC_IMAGE):   ("image",   _decode_image),
-            name_to_id.get(TOPIC_CAMINFO): ("caminfo", _decode_camera_info),
-            name_to_id.get(TOPIC_LIDAR):   ("lidar",   _decode_pointcloud2),
+            img_id:  ("image",   _decode_image),
+            cam_id:  ("caminfo", _decode_camera_info),
+            lid_id:  ("lidar",   _decode_pointcloud2),
         }
+        # Remove None keys (topics not found)
+        DECODERS = {k: v for k, v in DECODERS.items() if k is not None}
 
         for topic_id, ts_ns, raw_data in conn.execute(query, params):
             ts = ts_ns * 1e-9
