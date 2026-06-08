@@ -143,7 +143,8 @@ class SmartDecisionEngine:
         self,
         world_state,
         pred_state,
-        metric_detections: list
+        metric_detections: list,
+        ego_speed_mps: float = 5.0,   # actual / commanded vehicle speed
     ) -> SceneAssessment:
         """
         Full scene assessment — called every frame.
@@ -157,13 +158,22 @@ class SmartDecisionEngine:
             if md.bbox.track_id is not None:
                 metric_by_track[md.bbox.track_id] = md
 
+        # Physics-based distance thresholds, scaled by current speed.
+        # Use a minimum of 1.4 m/s (5 km/h) so thresholds never collapse to
+        # near-zero even when the vehicle is commanded to stop.
+        v_eff = max(float(ego_speed_mps), 1.4)
+        stop_dist = v_eff ** 2 / (2 * 4.0)     # comfortable stop at 4 m/s² decel
+        emrg_dist = v_eff ** 2 / (2 * 8.0)     # panic stop at 8 m/s² decel
+
         # ── Assess each actor ─────────────────────────────────────────────────
         assessments = []
         for actor in world_state.actors:
             if not actor.is_confirmed:
                 continue
             md = metric_by_track.get(actor.track_id)
-            assessment = self._assess_actor(actor, md, pred_state)
+            assessment = self._assess_actor(actor, md, pred_state,
+                                            stop_dist=stop_dist,
+                                            emrg_dist=emrg_dist)
             assessments.append(assessment)
 
         # ── Scene-level metrics ───────────────────────────────────────────────
@@ -181,9 +191,13 @@ class SmartDecisionEngine:
                           if a.time_to_reach is not None]
         min_ttr = min(times_to_reach) if times_to_reach else None
 
-        critical_count = sum(1 for d in distances if d < self.CRITICAL_M)
-        close_count = sum(1 for d in distances if self.CRITICAL_M <= d < self.CLOSE_M)
-        medium_count = sum(1 for d in distances if self.CLOSE_M <= d < self.MEDIUM_M)
+        # Speed-scaled zone boundaries
+        critical_m = max(self.CRITICAL_M,  emrg_dist + 1.5)
+        close_m    = max(self.CLOSE_M,     stop_dist * 3.0)
+        medium_m   = max(self.MEDIUM_M,    stop_dist * 6.0)
+        critical_count = sum(1 for d in distances if d < critical_m)
+        close_count = sum(1 for d in distances if critical_m <= d < close_m)
+        medium_count = sum(1 for d in distances if close_m <= d < medium_m)
 
         # ── Make decision ─────────────────────────────────────────────────────
         decision, reason, secondary = self._decide(
@@ -227,7 +241,8 @@ class SmartDecisionEngine:
         )
         return scene
 
-    def _assess_actor(self, actor, md, pred_state) -> ActorAssessment:
+    def _assess_actor(self, actor, md, pred_state,
+                      stop_dist=5.0, emrg_dist=2.5) -> ActorAssessment:
         """Full assessment of a single actor."""
 
         # Distance and position
@@ -278,7 +293,8 @@ class SmartDecisionEngine:
         # Decision contribution
         contribution = self._actor_contribution(
             dist, is_in_corridor, is_approaching,
-            approach_rate, actor.class_name, ped_state, ttr
+            approach_rate, actor.class_name, ped_state, ttr,
+            stop_dist=stop_dist, emrg_dist=emrg_dist,
         )
 
         return ActorAssessment(
@@ -373,47 +389,70 @@ class SmartDecisionEngine:
 
     def _actor_contribution(
         self, dist, in_corridor, approaching,
-        approach_rate, class_name, ped_state, ttr
+        approach_rate, class_name, ped_state, ttr,
+        stop_dist: float = 5.0,
+        emrg_dist: float = 2.5,
     ) -> str:
-        """What decision level does this actor drive?"""
-        # Emergency conditions
-        if ttr is not None and ttr < 1.5 and in_corridor:
-            return "EMERGENCY"
-        if dist < 3.0 and in_corridor:
+        """
+        What decision level does this actor drive?
+
+        All thresholds are derived from physics (stopping distance) so they
+        automatically scale with vehicle speed — at 5 km/h the thresholds
+        are much tighter than at 30 km/h.
+
+        stop_dist = v² / (2 * 4 m/s²)  — comfortable braking distance
+        emrg_dist = v² / (2 * 8 m/s²)  — panic braking distance
+        """
+        # TTC for actors closing toward ego
+        ttc = dist / max(approach_rate, 0.01) if approaching else float("inf")
+
+        # ── EMERGENCY ─────────────────────────────────────────────────────────
+        # Can't stop even with panic braking, or imminent collision (<1.5s)
+        if (dist < emrg_dist + 1.0 and in_corridor) or (ttc < 1.5 and in_corridor):
             return "EMERGENCY"
 
-        # Stop conditions
-        if dist < self.CRITICAL_M and in_corridor and approaching:
+        # ── STOP ──────────────────────────────────────────────────────────────
+        # Need to stop: obstacle is within comfortable stopping distance in path
+        if dist < stop_dist + 1.5 and in_corridor and approaching:
             return "STOP"
         if ped_state in (PED_STATES["on_path"], PED_STATES["running_toward"]):
             return "STOP"
+        if ttc < 2.5 and in_corridor:
+            return "STOP"
 
-        # Yield conditions
-        if ped_state == PED_STATES["crossing"] and dist < 10:
+        # ── YIELD ─────────────────────────────────────────────────────────────
+        ped_yield_m = max(6.0, stop_dist * 2.0)
+        if ped_state == PED_STATES["crossing"] and dist < ped_yield_m:
             return "YIELD"
-        if dist < self.CRITICAL_M and in_corridor:
-            return "YIELD"
+        if dist < stop_dist + 1.5 and in_corridor:
+            return "YIELD"   # stationary obstacle inside stopping distance
 
-        # Caution conditions
-        if ped_state == PED_STATES["approaching_road"] and dist < 8:
+        # ── CAUTION ───────────────────────────────────────────────────────────
+        ped_caution_m = max(5.0, stop_dist * 1.5 + 2.0)
+        if ped_state == PED_STATES["approaching_road"] and dist < ped_caution_m:
             return "CAUTION"
-        if dist < self.CLOSE_M and in_corridor and approaching:
+        if dist < stop_dist * 3.0 and in_corridor and approaching:
+            return "CAUTION"
+        if ttc < 5.0 and in_corridor:
             return "CAUTION"
 
-        # Slow conditions
-        if dist < self.CLOSE_M and approaching and approach_rate > self.SLOW_APPROACH_MS:
+        # ── SLOW ──────────────────────────────────────────────────────────────
+        slow_m = max(10.0, stop_dist * 4.0)
+        if dist < slow_m and approaching and approach_rate > self.SLOW_APPROACH_MS:
             return "SLOW"
-        if ped_state == PED_STATES["stationary_watch"] and dist < 8:
+        if ped_state == PED_STATES["stationary_watch"] and dist < max(6.0, stop_dist * 2.0):
             return "SLOW"
 
-        # Ease conditions
-        if dist < self.MEDIUM_M and in_corridor:
+        # ── EASE ──────────────────────────────────────────────────────────────
+        ease_m = max(15.0, stop_dist * 5.0)
+        if dist < ease_m and in_corridor:
             return "EASE"
         if ped_state == PED_STATES["approaching_road"]:
             return "EASE"
 
-        # Monitor
-        if dist < self.MEDIUM_M:
+        # ── MONITOR ───────────────────────────────────────────────────────────
+        monitor_m = max(25.0, stop_dist * 8.0)
+        if dist < monitor_m:
             return "MONITOR"
 
         return "CLEAR"

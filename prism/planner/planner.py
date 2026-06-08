@@ -52,7 +52,7 @@ logger = get_logger("AdaptivePlanner")
 # ── Vehicle dynamics constants ────────────────────────────────────────────────
 
 # nuScenes urban scenes; override via config
-DEFAULT_CRUISE_SPEED_MPS = 8.33   # 30 km/h
+DEFAULT_CRUISE_SPEED_MPS = 4.17   # 15 km/h — conservative campus/urban default
 DEFAULT_MAX_ACCEL        = 2.0    # m/s²  — gentle urban acceleration
 DEFAULT_MAX_DECEL        = 4.0    # m/s²  — firm braking (0.4 g)
 DEFAULT_EMERGENCY_DECEL  = 8.0    # m/s²  — panic brake (0.8 g)

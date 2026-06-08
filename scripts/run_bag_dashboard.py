@@ -59,16 +59,24 @@ _LEVEL     = {"CLEAR":0,"MONITOR":1,"EASE":2,"SLOW":3,
                "CAUTION":4,"YIELD":5,"STOP":6,"EMERGENCY":7}
 _LEVEL_INV = {v: k for k, v in _LEVEL.items()}
 
-def _escalate(decision: str, lidar_dets: list) -> str:
+def _escalate(decision: str, lidar_dets: list, ego_speed_mps: float = 5.0) -> str:
+    """
+    Escalate decision based on LiDAR corridor obstacles.
+    Thresholds are physics-based (stopping distance) so they scale with speed.
+    """
     corridor = [d for d in lidar_dets if abs(d.lateral_m) < 2.5]
     if not corridor:
         return decision
     nearest = min(corridor, key=lambda d: d.distance_m)
-    lidar_dec = ("EMERGENCY" if nearest.distance_m <  3 else
-                 "STOP"      if nearest.distance_m <  5 else
-                 "CAUTION"   if nearest.distance_m < 10 else
-                 "SLOW"      if nearest.distance_m < 20 else decision)
-    return _LEVEL_INV[max(_LEVEL.get(decision,0), _LEVEL.get(lidar_dec,0))]
+    v = max(float(ego_speed_mps), 1.4)          # min 5 km/h assumed speed
+    d_stop = v * v / (2 * 4.0)                  # comfortable stopping distance
+    d_emrg = v * v / (2 * 8.0)                  # panic stopping distance
+    d = nearest.distance_m
+    lidar_dec = ("EMERGENCY" if d < d_emrg + 1.0  else
+                 "STOP"      if d < d_stop + 1.5  else
+                 "CAUTION"   if d < d_stop * 3.0  else
+                 "SLOW"      if d < d_stop * 5.0  else decision)
+    return _LEVEL_INV[max(_LEVEL.get(decision, 0), _LEVEL.get(lidar_dec, 0))]
 
 
 # ── FPS tracker ────────────────────────────────────────────────────────────────
@@ -176,13 +184,14 @@ def main():
     logger.info("All components ready")
     logger.info("-" * 60)
 
-    fps_tracker = FPSTracker()
-    trajectory  = TrajectoryTracker(max_points=1000)
-    writer      = None
-    save_path   = None
-    frame_count = 0
-    paused      = False
+    fps_tracker     = FPSTracker()
+    trajectory      = TrajectoryTracker(max_points=1000)
+    writer          = None
+    save_path       = None
+    frame_count     = 0
+    paused          = False
     last_intrinsics = None
+    ego_speed_mps   = 0.0    # updated each frame from planner output
 
     # ── LiDAR background thread state ─────────────────────────────────────────
     _lidar_result = [None]   # shared between main and lidar thread
@@ -209,9 +218,10 @@ def main():
 
         # ── Resize to target width (keeps aspect ratio) ───────────────────────
         orig_h, orig_w = image.shape[:2]
+        img_scale = 1.0
         if orig_w != args.width:
-            scale = args.width / orig_w
-            new_h = int(orig_h * scale)
+            img_scale = args.width / orig_w
+            new_h = int(orig_h * img_scale)
             image = cv2.resize(image, (args.width, new_h), interpolation=cv2.INTER_LINEAR)
 
         frame_count += 1
@@ -225,9 +235,20 @@ def main():
                                             daemon=True)
             lidar_thread.start()
 
-        # ── Update intrinsics ─────────────────────────────────────────────────
+        # ── Update intrinsics — scale K matrix to match the resized image ─────
+        # YOLO bboxes are in resized-image pixel space; intrinsics from camera_info
+        # are at original resolution. Scaling fx, fy, cx, cy by img_scale ensures
+        # lateral_m calculations in MetricDepthEngine are correct.
         if intrinsics is not None:
-            metric_eng.update_intrinsics(intrinsics.to_calibration_dict())
+            calib = intrinsics.to_calibration_dict()
+            if img_scale != 1.0:
+                K = np.array(calib["camera_intrinsic"], dtype=np.float64)
+                K[0, 0] *= img_scale   # fx
+                K[0, 2] *= img_scale   # cx
+                K[1, 1] *= img_scale   # fy
+                K[1, 2] *= img_scale   # cy
+                calib["camera_intrinsic"] = K.tolist()
+            metric_eng.update_intrinsics(calib)
             last_intrinsics = intrinsics
 
         # ── Camera: SensoryCore ───────────────────────────────────────────────
@@ -265,10 +286,13 @@ def main():
         # ── Decision + Arbitration + Planner ──────────────────────────────────
         t6 = time.perf_counter()
         all_metric     = list(metric_dets) + [_LiDARMetricProxy(d) for d in lidar_dets]
-        scene          = dec_eng.assess(world_state, pred_state, all_metric)
+        scene          = dec_eng.assess(world_state, pred_state, all_metric,
+                                        ego_speed_mps=ego_speed_mps)
         arb_decision   = arb.arbitrate(world_state, pred_state, scene, timestamp)
-        final_decision = _escalate(arb_decision.action, lidar_dets)
+        final_decision = _escalate(arb_decision.action, lidar_dets,
+                                   ego_speed_mps=ego_speed_mps)
         plan           = planner.plan(arb_decision, all_metric, timestamp)
+        ego_speed_mps  = plan.current_speed_mps   # feed into next frame's decision
         timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
         # ── Render (trajectory.update called inside using lane_steer) ───────────
