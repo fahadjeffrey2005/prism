@@ -79,6 +79,56 @@ def _escalate(decision: str, lidar_dets: list, ego_speed_mps: float = 5.0) -> st
     return _LEVEL_INV[max(_LEVEL.get(decision, 0), _LEVEL.get(lidar_dec, 0))]
 
 
+# ── Ego speed estimator (optical flow based) ──────────────────────────────────
+class EgoSpeedEstimator:
+    """
+    Estimates actual forward speed from optical flow on the road surface.
+
+    Physics (pinhole camera, ground plane):
+        flow_y (road at distance d) ≈ fy * cam_h * v / (fps * d²)
+        → v ≈ flow_y * fps * d² / (fy * cam_h)
+
+    Uses lower-centre image patch (road ~8m ahead) as reference.
+    EMA-smoothed to suppress frame-to-frame jitter.
+    Much better than plan.current_speed_mps which ramps to cruise
+    regardless of actual vehicle state.
+    """
+    REF_DIST_M = 8.0    # reference ground distance for calibration
+    CAM_H_M    = 1.2    # camera height above ground (metres)
+    EMA_ALPHA  = 0.30   # smoothing — higher = more responsive, more noise
+    MAX_MPS    = 15.0   # clamp at 54 km/h; anything above is noise
+
+    def __init__(self):
+        self._speed = 0.0
+
+    def update(self, flow: "np.ndarray | None",
+               intrinsics=None, fps: float = 12.0) -> float:
+        if flow is None:
+            self._speed *= (1.0 - self.EMA_ALPHA)
+            return self._speed
+
+        h, w = flow.shape[:2]
+        # Lower-centre patch — road surface at ~REF_DIST_M ahead
+        y1, y2 = int(h * 0.68), int(h * 0.88)
+        x1, x2 = int(w * 0.30), int(w * 0.70)
+        road_vy = flow[y1:y2, x1:x2, 1]   # vertical component
+
+        # Forward motion → road moves DOWN in image (positive v)
+        fwd_flow = float(np.clip(road_vy, 0, None).mean())
+
+        # Calibration constant — use actual fy when available
+        fy = float(intrinsics.fy) * (w / intrinsics.width) if intrinsics else 600.0
+        k  = (fps * self.REF_DIST_M ** 2) / (fy * self.CAM_H_M)
+
+        raw = float(np.clip(fwd_flow * k, 0.0, self.MAX_MPS))
+        self._speed = (1.0 - self.EMA_ALPHA) * self._speed + self.EMA_ALPHA * raw
+        return self._speed
+
+    @property
+    def kmh(self) -> float:
+        return self._speed * 3.6
+
+
 # ── FPS tracker ────────────────────────────────────────────────────────────────
 class FPSTracker:
     def __init__(self, window=30):
@@ -186,12 +236,13 @@ def main():
 
     fps_tracker     = FPSTracker()
     trajectory      = TrajectoryTracker(max_points=1000)
+    speed_est       = EgoSpeedEstimator()   # optical-flow based actual speed
     writer          = None
     save_path       = None
     frame_count     = 0
     paused          = False
     last_intrinsics = None
-    ego_speed_mps   = 0.0    # updated each frame from planner output
+    ego_speed_mps   = 0.0    # estimated from optical flow, used for decisions
 
     # ── LiDAR background thread state ─────────────────────────────────────────
     _lidar_result = [None]   # shared between main and lidar thread
@@ -292,23 +343,30 @@ def main():
         final_decision = _escalate(arb_decision.action, lidar_dets,
                                    ego_speed_mps=ego_speed_mps)
         plan           = planner.plan(arb_decision, all_metric, timestamp)
-        ego_speed_mps  = plan.current_speed_mps   # feed into next frame's decision
         timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
-        # ── Render (trajectory.update called inside using lane_steer) ───────────
+        # ── Estimate actual ego speed from optical flow ────────────────────────
+        # Use this for both display and next frame's decision thresholds.
+        # plan.current_speed_mps is a commanded ramp — not the actual vehicle speed.
+        ego_speed_mps = speed_est.update(
+            sensory_frame.optical_flow, last_intrinsics, fps=12.0
+        )
+
+        # ── Render ────────────────────────────────────────────────────────────
         t7 = time.perf_counter()
         frame_result = {
-            "decision":      final_decision,
-            "risk":          world_state.risk_score,
-            "speed_mps":     plan.current_speed_mps,
-            "n_cam_dets":    len(sensory_frame.detections),
-            "n_lidar_dets":  len(lidar_dets),
-            "latency_ms":    (time.perf_counter() - t0) * 1000,
-            "frame_idx":     frame_count,
-            "throttle":      plan.control.throttle,
-            "brake":         plan.control.brake,
-            "sensory_frame": sensory_frame,
-            "timestamp":     timestamp,
+            "decision":        final_decision,
+            "risk":            world_state.risk_score,
+            "speed_mps":       ego_speed_mps,          # actual estimated speed
+            "n_cam_dets":      len(sensory_frame.detections),
+            "n_lidar_dets":    len(lidar_dets),
+            "latency_ms":      (time.perf_counter() - t0) * 1000,
+            "frame_idx":       frame_count,
+            "throttle":        plan.control.throttle,
+            "brake":           plan.control.brake,
+            "sensory_frame":   sensory_frame,
+            "timestamp":       timestamp,
+            "scene_assessment": scene,                  # for Scene Intelligence panel
         }
         out = render_dashboard(image, frame_result, lidar_dets,
                                trajectory=trajectory,

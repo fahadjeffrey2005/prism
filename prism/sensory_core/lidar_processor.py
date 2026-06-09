@@ -509,12 +509,12 @@ class FastLiDARProcessor:
             "cluster_voxel":     0.60,   # metres — clustering grid resolution
             "z_min":            -2.0,
             "z_max":             4.0,
-            "min_forward_dist":  0.5,
+            "min_forward_dist":  1.5,    # 1.5m min — eliminates ego body + ground ring
             "max_forward_dist": 50.0,
             "max_lateral_dist": 20.0,
             "ground_margin":     0.30,   # metres above cell min-z
-            "min_pts":           3,      # min points per cluster voxel
-            "min_cluster_pts":   5,      # min points to keep a cluster
+            "min_pts":           4,      # min points per cluster voxel
+            "min_cluster_pts":   8,      # min points to keep a cluster
             "merge_dist":        1.5,    # metres — merge nearby clusters
         }
         if params:

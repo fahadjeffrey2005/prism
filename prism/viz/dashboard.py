@@ -251,11 +251,11 @@ def draw_spatial_panel(panel: np.ndarray,
             cls  = md.class_name
             # 50.0 = geometry fallback (unreliable), filter it out
             if dist < 1.0 or dist >= 49.0:   continue
-            # Class-specific max range: persons visible to 40m, vehicles to 35m
-            max_d = 40.0 if cls in PERSON_CLS else 35.0
+            # Class-specific max reliable range for geometry-based depth
+            max_d = 25.0 if cls in PERSON_CLS else 30.0
             if dist > max_d:                 continue
-            if abs(lat) > 10.0:              continue
-            if md.confidence < 0.35:         continue
+            if abs(lat) > 8.0:               continue
+            if md.confidence < 0.45:         continue
             op = w2p(dist, lat)   # lat positive = right = correct, no negation
             if   cls in PERSON_CLS:   col, sym = COL_PERSON,     "P"
             elif cls in VEHICLE_CLS:  col, sym = COL_VEHICLE,    "V"
@@ -268,17 +268,22 @@ def draw_spatial_panel(panel: np.ndarray,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
 
     # ── LiDAR corridor obstacles (stationary = green) ─────────────────────
-    # lateral_m: positive = right of vehicle (matches map convention directly)
-    # No negation needed — w2p(d, lat) maps right=right correctly
-    CORRIDOR_LAT = 4.5
+    # Filters tuned for Livox non-repetitive scan:
+    #   - min 2.0m forward  (eliminates ego-vehicle and ground returns)
+    #   - max 3.5m lateral  (tighter corridor, reduces roadside false flares)
+    #   - min 12 points     (raises bar for sparse far-field clusters)
+    #   - min 0.15m height  (rejects flat ground-plane remnants)
+    CORRIDOR_LAT = 3.5
     for det in lidar_dets:
         d   = getattr(det, "distance_m", 0)
-        lat = getattr(det, "lateral_m",  0)   # positive = right
+        lat = getattr(det, "lateral_m",  0)
         n   = getattr(det, "n_points",   0)
-        if d <= 1.5 or d > view_fwd:  continue
+        h_m = getattr(det, "height_m",   1.0)
+        if d <= 2.0 or d > view_fwd:  continue
         if abs(lat) > CORRIDOR_LAT:   continue
-        if n < 8:                     continue
-        op  = w2p(d, lat)             # correct: right stays right
+        if n < 12:                    continue
+        if h_m < 0.15:                continue   # flat = ground, skip
+        op  = w2p(d, lat)
         cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
                       COL_STATIONARY,-1)
         cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
@@ -294,7 +299,7 @@ def draw_spatial_panel(panel: np.ndarray,
     for i,(sym,col) in enumerate([
         ("P", COL_PERSON),
         ("V", COL_VEHICLE),
-        ("■", COL_STATIONARY),
+        ("L", COL_STATIONARY),
         ("B", COL_BIKE),
     ]):
         lx = 4 + i*30
@@ -690,19 +695,57 @@ def render_dashboard(image: np.ndarray,
 
     div3_y=gcy+gr+20; cv2.line(sb,(0,div3_y),(sb_w,div3_y),div,1)
 
-    # ── S4: SYSTEM STATUS ─────────────────────────────────────────────────────
-    st_y=div3_y+12
-    dangers  = 1 if is_danger else 0
-    warnings = 1 if decision in ("CAUTION","YIELD","SLOW","EASE") else 0
-    _putc(sb,"SYSTEM STATUS",sb_w//2,st_y,0.28,TEXT_DIM)
-    for i,(txt,col) in enumerate([
-        (f"Detections: {n_cam+n_lidar}",         TEXT_WHITE),
-        (f"Dangers: {dangers}  Warnings: {warnings}",
-         WARN_RED if dangers else TEXT_WHITE),
-        (f"Flow steer: {flow_steer:+.3f}",        ACCENT_YELLOW),
-        (f"Frame: {frame_idx}",                   TEXT_DIM),
-    ]):
-        _put(sb,txt,pad,st_y+13+i*14,0.27,col)
+    # ── S4: SCENE INTELLIGENCE ────────────────────────────────────────────────────
+    st_y  = div3_y + 10
+    scene = frame_result.get("scene_assessment")
+    _putc(sb, "SCENE INTELLIGENCE", sb_w // 2, st_y, 0.28, TEXT_DIM)
+
+    si_lines = []   # (text, color) pairs
+
+    if scene is not None:
+        # Primary scene understanding
+        reason = scene.primary_reason or "Scanning scene..."
+        if len(reason) > 38:
+            reason = reason[:36] + ".."
+        threat_col = (WARN_RED if scene.closest_threat_m < 8
+                      else ACCENT_YELLOW if scene.closest_threat_m < 20
+                      else TEXT_WHITE)
+        si_lines.append((reason, threat_col))
+
+        # Actor breakdown
+        parts = []
+        if scene.ped_count > 0:
+            parts.append(f"{scene.ped_count} person{'s' if scene.ped_count>1 else ''}")
+        if scene.vehicle_count > 0:
+            parts.append(f"{scene.vehicle_count} vehicle{'s' if scene.vehicle_count>1 else ''}")
+        if not parts:
+            parts.append("No actors detected")
+        actor_str = "  ".join(parts)
+        if scene.closest_threat_m < 90:
+            actor_str += f"  |  Nearest {scene.closest_threat_m:.1f}m"
+        si_lines.append((actor_str, TEXT_WHITE))
+
+        # Corridor status
+        if scene.actors_in_corridor > 0:
+            si_lines.append((f"! {scene.actors_in_corridor} in corridor", WARN_RED))
+        elif scene.actors_approaching > 0:
+            si_lines.append((f"{scene.actors_approaching} approaching", ACCENT_YELLOW))
+        else:
+            si_lines.append(("Corridor clear", ACCENT_GREEN))
+    else:
+        si_lines.append(("Initialising...", TEXT_DIM))
+        si_lines.append(("", TEXT_DIM))
+        si_lines.append(("", TEXT_DIM))
+
+    # Telemetry footer
+    si_lines.append((
+        f"Fr:{frame_idx}  Str:{flow_steer:+.2f}  Cam:{n_cam}  Lid:{n_lidar}",
+        TEXT_DIM
+    ))
+
+    for i, (txt, col) in enumerate(si_lines[:5]):
+        if txt:
+            _put(sb, txt, pad, st_y + 14 + i * 14, 0.26, col)
 
     # ── Compose ───────────────────────────────────────────────────────────────
     out=np.zeros((cam_h_px,cam_w+sb_w,3),dtype=np.uint8)
