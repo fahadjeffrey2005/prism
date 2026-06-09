@@ -36,6 +36,7 @@ from prism.predictive_engine.engine import PredictiveEngine
 from prism.predictive_engine.decision import SmartDecisionEngine
 from prism.planner.planner import AdaptivePlanner
 from prism.arbitration.core import ArbitrationCore
+from prism.semantic_reasoner.reasoner import SemanticReasoner
 from prism.viz.dashboard import render_dashboard, TrajectoryTracker
 
 logger = get_logger("RunBagDashboard")
@@ -230,6 +231,7 @@ def main():
     dec_eng    = SmartDecisionEngine()
     arb        = ArbitrationCore(cfg)
     planner    = AdaptivePlanner(cfg)
+    reasoner   = SemanticReasoner(cfg)         # async VLM; safe in mock mode
 
     logger.info("All components ready")
     logger.info("-" * 60)
@@ -343,6 +345,8 @@ def main():
         final_decision = _escalate(arb_decision.action, lidar_dets,
                                    ego_speed_mps=ego_speed_mps)
         plan           = planner.plan(arb_decision, all_metric, timestamp)
+        # VLM semantic reasoner — non-blocking; returns output only when fresh
+        vlm_output     = reasoner.update(image, world_state, pred_state)
         timings["decision_ms"] = (time.perf_counter() - t6) * 1000
 
         # ── Estimate actual ego speed from optical flow ────────────────────────
@@ -366,7 +370,8 @@ def main():
             "brake":           plan.control.brake,
             "sensory_frame":   sensory_frame,
             "timestamp":       timestamp,
-            "scene_assessment": scene,                  # for Scene Intelligence panel
+            "scene_assessment": scene,
+            "vlm_output":       vlm_output or reasoner.get_current_semantic_state(),
         }
         out = render_dashboard(image, frame_result, lidar_dets,
                                trajectory=trajectory,

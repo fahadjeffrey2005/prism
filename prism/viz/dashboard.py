@@ -177,137 +177,164 @@ def draw_spatial_panel(panel: np.ndarray,
                        speed_mps: float,
                        metric_dets: list = None):
     """
-    Forward-only top-down VLAM spatial view.
-    Shows PLANNED path ahead + real-time obstacles.
-    No trajectory history (prevents spiral accumulation).
-
-    Obstacles colour-coded by class:
-      Red   = person
-      Green = vehicle (car/truck/bus)
-      Yellow= bicycle/motorcycle
-      Blue  = LiDAR cluster (unknown class)
+    Forward-only top-down spatial view.
+    Detection-aware: panel brightens and highlights when obstacles are present,
+    shows CLEAR indicator when empty, labels every detection with distance.
     """
     h, w = panel.shape[:2]
     view_fwd = 30.0
     view_lat = 15.0
     ex, ey   = w // 2, h - 22
 
+    PERSON_CLS  = {"person"}
+    VEHICLE_CLS = {"car", "truck", "bus"}
+    BIKE_CLS    = {"bicycle", "motorcycle"}
+    SIGNAL_CLS  = {"traffic light", "stop sign"}
+    CORRIDOR_LAT_DISPLAY = 3.5   # lateral limit for spatial panel display
+
     def w2p(fwd_m, lat_m):
-        px = int(np.clip(ex + lat_m / view_lat * (w//2 - 4), 2, w-2))
-        py = int(np.clip(ey - fwd_m / view_fwd * (h-30),     2, h-2))
+        px = int(np.clip(ex + lat_m / view_lat * (w // 2 - 4), 2, w - 2))
+        py = int(np.clip(ey - fwd_m / view_fwd * (h - 30),     2, h - 2))
         return px, py
 
-    # Background + grid
-    cv2.rectangle(panel, (0,0), (w-1,h-1), (14,20,14), -1)
+    # ── Background + grid ─────────────────────────────────────────────────
+    cv2.rectangle(panel, (0, 0), (w-1, h-1), (14, 20, 14), -1)
     for fm in range(0, int(view_fwd)+1, 5):
-        p1 = w2p(fm,-view_lat); p2 = w2p(fm,view_lat)
-        cv2.line(panel, p1, p2, (24,36,24), 1)
+        p1 = w2p(fm, -view_lat); p2 = w2p(fm, view_lat)
+        cv2.line(panel, p1, p2, (24, 36, 24), 1)
         if fm > 0 and fm % 10 == 0:
-            cv2.putText(panel,f"{fm}m",(p1[0]+2,p1[1]-2),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.22,TEXT_DIM,1)
-    for lm in range(-int(view_lat),int(view_lat)+1,5):
-        cv2.line(panel, w2p(0,lm), w2p(view_fwd,lm), (24,36,24), 1)
+            cv2.putText(panel, f"{fm}m", (p1[0]+2, p1[1]-2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_DIM, 1)
+    for lm in range(-int(view_lat), int(view_lat)+1, 5):
+        cv2.line(panel, w2p(0, lm), w2p(view_fwd, lm), (24, 36, 24), 1)
 
-    # ── Planned path corridor ─────────────────────────────────────────────
-    dists = np.array([0, 1, 2, 3, 4.5, 6, 8, 10.5, 13, 16, 20, 25])
-    lpts, rpts = [], []
-    for d in dists:
-        lat_c = flow_steer * (d**1.5) * 0.07
-        lpts.append(w2p(d, lat_c - 1.4))
-        rpts.append(w2p(d, lat_c + 1.4))
-    poly = np.array(lpts + rpts[::-1], np.int32)
-    ov   = panel.copy()
-    cv2.fillPoly(ov, [poly], (15,70,15))
-    cv2.addWeighted(ov, 0.55, panel, 0.45, 0, panel)
-    for i in range(len(lpts)-1):
-        cv2.line(panel, lpts[i], lpts[i+1], (30,30,180), 1)
-        cv2.line(panel, rpts[i], rpts[i+1], (30,30,180), 1)
-    # Centre dashes
-    for i in range(0, len(dists)-1, 2):
-        lat_c = flow_steer * (dists[i]**1.5) * 0.07
-        cv2.line(panel, w2p(dists[i],lat_c),
-                 w2p(dists[min(i+1,len(dists)-1)],lat_c),(120,120,120),1)
-
-    # ── Colour scheme ─────────────────────────────────────────────────────
-    # RED    = persons  (dynamic, high priority)
-    # YELLOW = vehicles (dynamic, moving threats)
-    # GREEN  = stationary objects (poles, walls, LiDAR clusters)
-    COL_PERSON    = (0,   50, 230)   # red
-    COL_VEHICLE   = (0,  220, 220)   # yellow
-    COL_STATIONARY= (30, 180,  30)   # green
-    COL_BIKE      = (0,  200, 255)   # orange (semi-dynamic)
-
-    PERSON_CLS  = {"person"}
-    VEHICLE_CLS = {"car","truck","bus"}
-    BIKE_CLS    = {"bicycle","motorcycle"}
-    SIGNAL_CLS  = {"traffic light","stop sign"}
-
-    # ── YOLO detections via MetricDepth (accurate geometry-based positions) ──
-    # MetricDetection has real distance_m and lateral_m from camera intrinsics
+    # ── Pre-scan: validate and collect detections ─────────────────────────
+    valid_metric = []
     if metric_dets:
         for md in metric_dets:
             dist = float(md.distance_m)
-            lat  = float(md.lateral_m)   # positive = right of vehicle
-            cls  = md.class_name
-            # 50.0 = geometry fallback (unreliable), filter it out
-            if dist < 1.0 or dist >= 49.0:   continue
-            # Class-specific max reliable range for geometry-based depth
+            lat  = float(md.lateral_m)
+            cls  = getattr(md, "class_name", "unknown")
+            if dist < 1.0 or dist >= 49.0: continue
             max_d = 25.0 if cls in PERSON_CLS else 30.0
-            if dist > max_d:                 continue
-            if abs(lat) > 8.0:               continue
-            if md.confidence < 0.45:         continue
-            op = w2p(dist, lat)   # lat positive = right = correct, no negation
-            if   cls in PERSON_CLS:   col, sym = COL_PERSON,     "P"
-            elif cls in VEHICLE_CLS:  col, sym = COL_VEHICLE,    "V"
-            elif cls in BIKE_CLS:     col, sym = COL_BIKE,       "B"
-            elif cls in SIGNAL_CLS:   col, sym = COL_STATIONARY, "S"
-            else:                     col, sym = (150,150,150),  "?"
-            cv2.circle(panel, op, 6, col, -1)
-            cv2.circle(panel, op, 6, TEXT_WHITE, 1)
-            cv2.putText(panel, sym, (op[0]-3, op[1]+3),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
+            if dist > max_d:    continue
+            if abs(lat) > 8.0:  continue
+            if getattr(md, "confidence", 1.0) < 0.45: continue
+            valid_metric.append((dist, lat, cls))
 
-    # ── LiDAR corridor obstacles (stationary = green) ─────────────────────
-    # Filters tuned for Livox non-repetitive scan:
-    #   - min 2.0m forward  (eliminates ego-vehicle and ground returns)
-    #   - max 3.5m lateral  (tighter corridor, reduces roadside false flares)
-    #   - min 12 points     (raises bar for sparse far-field clusters)
-    #   - min 0.15m height  (rejects flat ground-plane remnants)
-    CORRIDOR_LAT = 3.5
+    valid_lidar = []
     for det in lidar_dets:
         d   = getattr(det, "distance_m", 0)
         lat = getattr(det, "lateral_m",  0)
         n   = getattr(det, "n_points",   0)
         h_m = getattr(det, "height_m",   1.0)
-        if d <= 2.0 or d > view_fwd:  continue
-        if abs(lat) > CORRIDOR_LAT:   continue
-        if n < 12:                    continue
-        if h_m < 0.15:                continue   # flat = ground, skip
-        op  = w2p(d, lat)
-        cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
-                      COL_STATIONARY,-1)
-        cv2.rectangle(panel,(op[0]-5,op[1]-6),(op[0]+5,op[1]+2),
-                      TEXT_WHITE,1)
+        if d <= 2.0 or d > view_fwd:        continue
+        if abs(lat) > CORRIDOR_LAT_DISPLAY:  continue
+        if n < 12:                           continue
+        if h_m < 0.15:                       continue
+        valid_lidar.append((d, lat, det))
+
+    # Corridor occupancy — drives visual severity
+    corridor_dists = [dist for dist, lat, _ in valid_metric if abs(lat) < 2.5]
+    corridor_dists += [d   for d, lat, _   in valid_lidar   if abs(lat) < 2.5]
+    has_corridor   = len(corridor_dists) > 0
+    nearest_m      = min(corridor_dists) if corridor_dists else None
+    total_dets     = len(valid_metric) + len(valid_lidar)
+
+    # ── Path corridor — brightness reacts to corridor occupancy ──────────
+    dists = np.array([0, 1, 2, 3, 4.5, 6, 8, 10.5, 13, 16, 20, 25])
+    lpts, rpts = [], []
+    for d in dists:
+        lat_c = flow_steer * (d ** 1.5) * 0.07
+        lpts.append(w2p(d, lat_c - 1.4))
+        rpts.append(w2p(d, lat_c + 1.4))
+    poly = np.array(lpts + rpts[::-1], np.int32)
+    ov   = panel.copy()
+
+    if nearest_m is not None and nearest_m < 8:
+        fill_col   = (10, 60, 140)   # orange tint — threat close
+        line_col   = (30, 80, 220)
+        fill_alpha = 0.70
+    elif has_corridor:
+        fill_col   = (10, 80, 60)    # yellow-green — threat present
+        line_col   = (30, 50, 180)
+        fill_alpha = 0.60
+    else:
+        fill_col   = (10, 45, 10)    # dim green — all clear
+        line_col   = (22, 22, 130)
+        fill_alpha = 0.42
+
+    cv2.fillPoly(ov, [poly], fill_col)
+    cv2.addWeighted(ov, fill_alpha, panel, 1.0 - fill_alpha, 0, panel)
+    for i in range(len(lpts)-1):
+        cv2.line(panel, lpts[i], lpts[i+1], line_col, 1)
+        cv2.line(panel, rpts[i], rpts[i+1], line_col, 1)
+    for i in range(0, len(dists)-1, 2):
+        lat_c = flow_steer * (dists[i] ** 1.5) * 0.07
+        cv2.line(panel,
+                 w2p(dists[i], lat_c),
+                 w2p(dists[min(i+1, len(dists)-1)], lat_c),
+                 (90, 90, 90), 1)
+
+    # ── Colours ───────────────────────────────────────────────────────────
+    COL_PERSON     = (0,   50, 230)
+    COL_VEHICLE    = (0,  220, 220)
+    COL_STATIONARY = (30, 180,  30)
+    COL_BIKE       = (0,  200, 255)
+
+    # ── YOLO / MetricDepth detections ─────────────────────────────────────
+    for dist, lat, cls in valid_metric:
+        op = w2p(dist, lat)
+        if   cls in PERSON_CLS:  col, sym = COL_PERSON,     "P"
+        elif cls in VEHICLE_CLS: col, sym = COL_VEHICLE,    "V"
+        elif cls in BIKE_CLS:    col, sym = COL_BIKE,       "B"
+        elif cls in SIGNAL_CLS:  col, sym = COL_STATIONARY, "S"
+        else:                    col, sym = (150, 150, 150), "?"
+        cv2.circle(panel, op, 7, col, -1)
+        cv2.circle(panel, op, 7, TEXT_WHITE, 1)
+        cv2.putText(panel, sym, (op[0]-3, op[1]+3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, TEXT_WHITE, 1)
+        cv2.putText(panel, f"{dist:.0f}m", (op[0]+9, op[1]+3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.20, col, 1)
+
+    # ── LiDAR detections ──────────────────────────────────────────────────
+    for d, lat, det in valid_lidar:
+        op = w2p(d, lat)
+        cv2.rectangle(panel, (op[0]-5, op[1]-6), (op[0]+5, op[1]+2),
+                      COL_STATIONARY, -1)
+        cv2.rectangle(panel, (op[0]-5, op[1]-6), (op[0]+5, op[1]+2),
+                      TEXT_WHITE, 1)
+        cv2.putText(panel, f"{d:.0f}m", (op[0]+7, op[1]+2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.20, COL_STATIONARY, 1)
+
+    # ── Status overlay ────────────────────────────────────────────────────
+    if total_dets == 0:
+        cv2.putText(panel, "CLEAR", (ex - 16, ey - 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, ACCENT_GREEN, 1)
+    else:
+        cv2.putText(panel, f"{total_dets} obj", (3, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.24, TEXT_WHITE, 1)
+        if nearest_m is not None:
+            warn_col = WARN_RED if nearest_m < 6 else ACCENT_YELLOW
+            cv2.putText(panel, f"!{nearest_m:.0f}m", (w - 34, 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.24, warn_col, 1)
 
     # ── Ego vehicle ───────────────────────────────────────────────────────
-    cv2.rectangle(panel,(ex-5,ey-12),(ex+5,ey),ACCENT_GREEN,-1)
-    cv2.rectangle(panel,(ex-5,ey-12),(ex+5,ey),TEXT_WHITE,1)
+    cv2.rectangle(panel, (ex-5, ey-12), (ex+5, ey), ACCENT_GREEN, -1)
+    cv2.rectangle(panel, (ex-5, ey-12), (ex+5, ey), TEXT_WHITE, 1)
     hdiff = int(flow_steer * 14)
-    cv2.arrowedLine(panel,(ex,ey-12),(ex+hdiff,ey-26),TEXT_WHITE,1,tipLength=0.4)
+    cv2.arrowedLine(panel, (ex, ey-12), (ex+hdiff, ey-26),
+                    TEXT_WHITE, 1, tipLength=0.4)
 
     # ── Legend ────────────────────────────────────────────────────────────
-    for i,(sym,col) in enumerate([
-        ("P", COL_PERSON),
-        ("V", COL_VEHICLE),
-        ("L", COL_STATIONARY),
-        ("B", COL_BIKE),
+    for i, (sym, col) in enumerate([
+        ("P", COL_PERSON), ("V", COL_VEHICLE),
+        ("L", COL_STATIONARY), ("B", COL_BIKE),
     ]):
-        lx = 4 + i*30
-        ly = h - 5
-        cv2.putText(panel, sym, (lx, ly),
+        cv2.putText(panel, sym, (4 + i*30, h-5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.22, col, 1)
 
-    cv2.rectangle(panel,(0,0),(w-1,h-1),(45,65,45),1)
+    cv2.rectangle(panel, (0, 0), (w-1, h-1), (45, 65, 45), 1)
 
 
 # ============================================================================
@@ -651,7 +678,7 @@ def render_dashboard(image: np.ndarray,
 
     # ── S1: SPATIAL AWARENESS (unified BEV + trajectory) ─────────────────────
     sa_lh = 20
-    sa_h  = int(cam_h_px * 0.42)
+    sa_h  = int(cam_h_px * 0.36)   # reduced from 0.42 to make room for reasoning strip
     _putc(sb,"SPATIAL AWARENESS",sb_w//2,sa_lh-3,0.30,TEXT_DIM)
     sa_panel = sb[sa_lh:sa_h, pad:sb_w-pad].copy()
     draw_spatial_panel(sa_panel, lidar_dets, yolo_dets,
@@ -746,6 +773,55 @@ def render_dashboard(image: np.ndarray,
     for i, (txt, col) in enumerate(si_lines[:5]):
         if txt:
             _put(sb, txt, pad, st_y + 14 + i * 14, 0.26, col)
+
+    # ── S5: LIVE REASONING (VLM when fired, SmartDecision secondary otherwise) ──
+    si_bottom = st_y + 14 + 5 * 14 + 6
+    cv2.line(sb, (0, si_bottom), (sb_w, si_bottom), div, 1)
+    lr_y = si_bottom + 8
+
+    vlm_out = frame_result.get("vlm_output")
+    _putc(sb, "LIVE REASONING", sb_w // 2, lr_y, 0.27, TEXT_DIM)
+
+    reasoning_lines = []
+
+    if vlm_out is not None and vlm_out.success:
+        import time as _time
+        age = _time.time() - vlm_out.timestamp
+        age_col = TEXT_WHITE if age < 3.0 else TEXT_DIM
+
+        # Scene summary from VLM
+        summary = vlm_out.scene_summary or vlm_out.scene_context or ""
+        if len(summary) > 40: summary = summary[:38] + ".."
+        if summary:
+            reasoning_lines.append((f"VLM: {summary}", age_col))
+
+        # Risk flags
+        for flag in vlm_out.risk_flags[:2]:
+            flag_str = flag[:38] if len(flag) > 38 else flag
+            reasoning_lines.append((f"  - {flag_str}", ACCENT_YELLOW))
+
+        # Caution level with age
+        caution = vlm_out.recommended_caution.upper()
+        reasoning_lines.append((
+            f"Caution: {caution}  [{age:.0f}s ago]",
+            WARN_RED if caution in ("HIGH","CRITICAL") else age_col
+        ))
+    else:
+        # VLM not enabled / no output — show SmartDecision secondary reasons
+        if scene is not None and scene.secondary_reasons:
+            for r in scene.secondary_reasons[:3]:
+                r_str = r[:38] if len(r) > 38 else r
+                reasoning_lines.append((r_str, TEXT_WHITE))
+        elif scene is not None:
+            reasoning_lines.append(("Scene nominal — no alerts", ACCENT_GREEN))
+        else:
+            reasoning_lines.append(("Waiting for scene data...", TEXT_DIM))
+
+        reasoning_lines.append(("[VLM off — enable in config]", TEXT_DIM))
+
+    for i, (txt, col) in enumerate(reasoning_lines[:4]):
+        if txt:
+            _put(sb, txt, pad, lr_y + 13 + i * 14, 0.25, col)
 
     # ── Compose ───────────────────────────────────────────────────────────────
     out=np.zeros((cam_h_px,cam_w+sb_w,3),dtype=np.uint8)
