@@ -19,6 +19,7 @@ Sidebar (top to bottom):
   - SYSTEM STATUS
 """
 
+import time
 import cv2
 import math
 import numpy as np
@@ -219,7 +220,7 @@ def draw_spatial_panel(panel: np.ndarray,
             max_d = 25.0 if cls in PERSON_CLS else 30.0
             if dist > max_d:    continue
             if abs(lat) > 8.0:  continue
-            if getattr(md, "confidence", 1.0) < 0.45: continue
+            if getattr(md, "confidence", 1.0) < 0.38: continue
             valid_metric.append((dist, lat, cls))
 
     valid_lidar = []
@@ -644,7 +645,7 @@ def render_dashboard(image: np.ndarray,
     # ── Top-left HUD ──────────────────────────────────────────────────────────
     _blend(cam,0,0,310,48,(0,0,0),0.52)
     _put(cam,"PRISM  AUTONOMOUS  PERCEPTION",8,17,0.44,TEXT_CYAN)
-    _put(cam,f"FPS: {fps:.1f}  |  Speed cmd: {speed_kmh:.0f} km/h",8,36,0.36,ACCENT_GREEN)
+    _put(cam,f"FPS: {fps:.1f}  |  Speed: {speed_kmh:.0f} km/h",8,36,0.36,ACCENT_GREEN)
 
     # ── Top-centre: real YOLO counts ─────────────────────────────────────────
     n_persons  = sum(1 for d in yolo_dets if d.bbox.class_name in PERSON_CLS)
@@ -730,8 +731,9 @@ def render_dashboard(image: np.ndarray,
     si_lines = []   # (text, color) pairs
 
     if scene is not None:
-        # Primary scene understanding
-        reason = scene.primary_reason or "Scanning scene..."
+        # Primary scene understanding — strip non-ASCII (Hershey font is ASCII-only)
+        raw_reason = scene.primary_reason or "Scanning scene..."
+        reason = ''.join(c if ord(c) < 128 else '-' for c in raw_reason)
         if len(reason) > 38:
             reason = reason[:36] + ".."
         threat_col = (WARN_RED if scene.closest_threat_m < 8
@@ -779,25 +781,29 @@ def render_dashboard(image: np.ndarray,
     cv2.line(sb, (0, si_bottom), (sb_w, si_bottom), div, 1)
     lr_y = si_bottom + 8
 
-    vlm_out = frame_result.get("vlm_output")
-    _putc(sb, "LIVE REASONING", sb_w // 2, lr_y, 0.27, TEXT_DIM)
+    vlm_out     = frame_result.get("vlm_output")
+    vlm_is_real = frame_result.get("vlm_is_real", False)
+    hdr_tag     = "LIVE REASONING" if vlm_is_real else "LIVE REASONING (SIM)"
+    _putc(sb, hdr_tag, sb_w // 2, lr_y, 0.27, TEXT_DIM)
 
     reasoning_lines = []
 
     if vlm_out is not None and vlm_out.success:
-        import time as _time
-        age = _time.time() - vlm_out.timestamp
+        age = time.time() - vlm_out.timestamp
         age_col = TEXT_WHITE if age < 3.0 else TEXT_DIM
 
-        # Scene summary from VLM
-        summary = vlm_out.scene_summary or vlm_out.scene_context or ""
-        if len(summary) > 40: summary = summary[:38] + ".."
+        # Scene summary — strip non-ASCII
+        raw_sum = vlm_out.scene_summary or vlm_out.scene_context or ""
+        summary = ''.join(c if ord(c) < 128 else '-' for c in raw_sum)
+        if len(summary) > 38: summary = summary[:36] + ".."
+        prefix = "VLM:" if vlm_is_real else "SIM:"
         if summary:
-            reasoning_lines.append((f"VLM: {summary}", age_col))
+            reasoning_lines.append((f"{prefix} {summary}", age_col))
 
         # Risk flags
         for flag in vlm_out.risk_flags[:2]:
-            flag_str = flag[:38] if len(flag) > 38 else flag
+            flag_str = ''.join(c if ord(c) < 128 else '-' for c in flag)
+            flag_str = flag_str[:36] if len(flag_str) > 36 else flag_str
             reasoning_lines.append((f"  - {flag_str}", ACCENT_YELLOW))
 
         # Caution level with age
