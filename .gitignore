@@ -37,3 +37,22 @@ visualizations/
 # Logs
 *.log
 ._*
+prism_data/
+.venv/
+.pt
+.engine
+.onnx
+.db3
+.venvjetson/
+.venv/
+*.db3
+*.whl
+*.so
+ngrok
+prism_data/
+pycache/
+*.pyc
+datasets/
+nohup.out
+site-packages/
+.venv_jetson/

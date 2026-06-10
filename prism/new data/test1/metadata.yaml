@@ -1,0 +1,43 @@
+rosbag2_bagfile_information:
+  version: 3
+  storage_identifier: sqlite3
+  compression_format: ""
+  compression_mode: ""
+  relative_file_paths:
+  - test1.db3
+  duration:
+    nanoseconds: 236731604468
+  starting_time:
+    nanoseconds_since_epoch: 1779697634344896571
+  message_count: 703871
+  topics_with_message_count:
+  - topic_metadata:
+      name: /tf
+      type: tf2_msgs/msg/TFMessage
+      serialization_format: cdr
+    message_count: 674497
+  - topic_metadata:
+      name: /imu/data
+      type: sensor_msgs/msg/Imu
+      serialization_format: cdr
+    message_count: 23337
+  - topic_metadata:
+      name: /tf_static
+      type: tf2_msgs/msg/TFMessage
+      serialization_format: cdr
+    message_count: 1
+  - topic_metadata:
+      name: /usb_cam/camera_info
+      type: sensor_msgs/msg/CameraInfo
+      serialization_format: cdr
+    message_count: 1864
+  - topic_metadata:
+      name: /usb_cam/image_raw
+      type: sensor_msgs/msg/Image
+      serialization_format: cdr
+    message_count: 1859
+  - topic_metadata:
+      name: /velodyne_points
+      type: sensor_msgs/msg/PointCloud2
+      serialization_format: cdr
+    message_count: 2313

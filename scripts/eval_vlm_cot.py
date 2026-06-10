@@ -95,5 +95,5 @@ nusc = NuScenes(
     verbose=False
 )
 
-for scene_idx in [6, 7, 8, 9]:
+for scene_idx in [2, 3, 4, 5]:
     run_eval(model, processor, nusc, scene_idx)
