@@ -1,0 +1,79 @@
+# PRISM — Mac Dev Config
+# =======================
+# VLM disabled (no CUDA on Mac). Everything else runs on MPS.
+# For Jetson production: use config.yaml
+
+# ── Sensory Core ──────────────────────────────────────────────────────────────
+sensory_core:
+  device: mps
+  model: yolov8n.pt
+  confidence_threshold: 0.35
+  iou_threshold: 0.45
+  img_size: 640
+  sampling:
+    detection_fps: 12
+    depth_fps: 4
+    flow_fps: 12
+  depth:
+    model: depth_anything_v2_small
+    device: mps
+
+# ── World Model ───────────────────────────────────────────────────────────────
+world_model:
+  max_actors: 20
+  tracker:
+    max_age: 5
+    min_hits: 2
+    iou_threshold: 0.3
+  bev:
+    grid_size_m: 40.0
+    resolution: 0.25
+  risk:
+    close_threshold_m: 5.0
+    medium_threshold_m: 15.0
+
+# ── Predictive Engine ─────────────────────────────────────────────────────────
+predictive_engine:
+  horizon_s: 6.0
+  intent_classes: 9
+  lstm:
+    enabled: true
+    hidden_size: 128
+    num_layers: 2
+    min_track_length: 8
+  divergence_threshold: 0.40
+
+# ── VLM / Semantic Reasoner ───────────────────────────────────────────────────
+vlm:
+  enabled: false            # No CUDA on Mac — runs in mock mode
+  device: mps
+  model_id: Qwen/Qwen2.5-VL-7B-Instruct
+  model_dir: ~/prism_data/models/qwen2_5_vl_7b
+  divergence_threshold: 0.40
+  max_silence_s: 8.0
+  cooldown_s: 0.4
+
+# ── Arbitration Core ──────────────────────────────────────────────────────────
+arbitration:
+  weights:
+    smart_decision: 0.35
+    predictive:     0.35
+    world_model:    0.15
+    vlm:            0.15
+  vlm_staleness:
+    tau_s: 2.0
+    w_min: 0.02
+  safety_buffer_threshold: 1.5
+
+# ── Adaptive Planner ──────────────────────────────────────────────────────────
+planner:
+  cruise_speed_mps: 5.56
+  max_jerk: 2.0
+  comfortable_decel: 4.0
+  emergency_decel: 8.0
+
+# ── Logging / Output ──────────────────────────────────────────────────────────
+logging:
+  viz_output_dir: ~/prism_data/experiments/visualizations/bag_runs
+  trigger_log_dir: ~/prism_data/logs/triggers
+  level: INFO
