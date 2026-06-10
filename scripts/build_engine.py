@@ -62,7 +62,8 @@ config.set_memory_pool_limit(
     trt.MemoryPoolType.WORKSPACE,
     WORKSPACE_GB * (1 << 30)
 )
-config.set_flag(trt.BuilderFlag.FP16)
+# TRT 11: FP16 is no longer a BuilderFlag — Thor/Hopper uses optimal precision automatically
+# TF32 is enabled by default on Hopper for max throughput
 
 print(f"\nBuilding FP16 engine (workspace={WORKSPACE_GB}GB)...")
 print("This takes 3-10 minutes on first run.")
