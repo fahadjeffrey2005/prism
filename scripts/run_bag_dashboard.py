@@ -231,10 +231,10 @@ def main():
     dec_eng    = SmartDecisionEngine()
     arb        = ArbitrationCore(cfg)
     planner    = AdaptivePlanner(cfg)
-    # Only instantiate SemanticReasoner if VLM is explicitly enabled in config —
-    # it starts a background thread even in mock mode which adds scheduling overhead.
     _vlm_enabled = cfg.get("vlm", {}).get("enabled", False)
     reasoner     = SemanticReasoner(cfg) if _vlm_enabled else None
+    if reasoner is not None:
+        reasoner.start_logging(bag_path.stem)
 
     logger.info("All components ready")
     logger.info("-" * 60)
@@ -440,6 +440,8 @@ def main():
                     frame_count = args.max_frames or frame_count + 1
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
+    if reasoner is not None:
+        reasoner.stop_logging()
     if writer:
         writer.release()
         logger.info(f"Saved: {save_path}")

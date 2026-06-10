@@ -633,7 +633,78 @@ class SemanticReasoner:
         self.latest_output: Optional[VLMOutput] = None
         self._frame_count = 0
 
+        # Trigger logger — activated via start_logging()
+        self._log_file   = None
+        self._log_writer = None
+
         logger.info(f"Semantic Reasoner ready | VLM available: {self.vlm.available}")
+
+    # ── Trigger logging ───────────────────────────────────────────────────────
+
+    def start_logging(self, bag_name: str,
+                      log_dir: str = "~/prism_data/logs/triggers") -> str:
+        """
+        Open a per-bag CSV trigger log.
+        Call before the main loop, stop_logging() after.
+        Logs EVERY frame so fixed-rate ablation can be simulated in post-processing.
+
+        CSV columns:
+            timestamp, frame_idx, divergence_score, actor_count, risk_level,
+            risk_score, triggered, trigger_condition,
+            vlm_caution, vlm_scene, vlm_flags
+        """
+        import csv, os
+        from pathlib import Path
+        log_path = Path(log_dir).expanduser()
+        log_path.mkdir(parents=True, exist_ok=True)
+        csv_path = log_path / f"triggers_{bag_name}.csv"
+        self._log_file   = open(str(csv_path), "w", newline="")
+        self._log_writer = csv.DictWriter(self._log_file, fieldnames=[
+            "timestamp", "frame_idx",
+            "divergence_score", "actor_count", "risk_level", "risk_score",
+            "triggered", "trigger_condition",
+            "vlm_caution", "vlm_scene", "vlm_flags",
+        ])
+        self._log_writer.writeheader()
+        logger.info(f"Trigger logging → {csv_path}")
+        return str(csv_path)
+
+    def stop_logging(self):
+        if self._log_file:
+            self._log_file.flush()
+            self._log_file.close()
+            self._log_file   = None
+            self._log_writer = None
+            logger.info("Trigger log closed")
+
+    def _write_log_row(self, world_state, pred_state,
+                       trigger_reason: Optional[str],
+                       new_output: Optional[VLMOutput]):
+        if self._log_writer is None:
+            return
+        try:
+            self._log_writer.writerow({
+                "timestamp":        round(time.time(), 4),
+                "frame_idx":        self._frame_count,
+                "divergence_score": round(pred_state.divergence_score, 4),
+                "actor_count":      world_state.actor_count,
+                "risk_level":       world_state.risk_level,
+                "risk_score":       round(world_state.risk_score, 3),
+                "triggered":        1 if trigger_reason else 0,
+                "trigger_condition": trigger_reason or "",
+                "vlm_caution":      new_output.recommended_caution if new_output else "",
+                "vlm_scene":        (new_output.scene_context[:60]
+                                     if new_output else "").replace(",", ";"),
+                "vlm_flags":        ("|".join(new_output.risk_flags[:3])
+                                     if new_output else ""),
+            })
+            # Flush every 100 frames so data survives a crash
+            if self._frame_count % 100 == 0:
+                self._log_file.flush()
+        except Exception as e:
+            logger.warning(f"Trigger log write error: {e}")
+
+    # ── Main update ───────────────────────────────────────────────────────────
 
     def update(
         self,
@@ -647,12 +718,14 @@ class SemanticReasoner:
         1. Check if VLM should be triggered
         2. If yes, post job to background worker (returns immediately)
         3. Check if background worker has a new result
-        4. Return new result if available, else None
+        4. Log frame data (always, for ablation analysis)
+        5. Return new result if available, else None
         """
         self._frame_count += 1
 
-        # VLM disabled (ablation mode) — short-circuit, return nothing
+        # VLM disabled — still log frames if logger is active
         if not self.vlm._enabled:
+            self._write_log_row(world_state, pred_state, None, None)
             return None
 
         # Check trigger
@@ -671,9 +744,11 @@ class SemanticReasoner:
         new_output = self.worker.get_latest_output()
         if new_output:
             self.latest_output = new_output
-            return new_output
 
-        return None
+        # Log this frame
+        self._write_log_row(world_state, pred_state, trigger_reason, new_output)
+
+        return new_output if new_output else None
 
     def get_current_semantic_state(self) -> Optional[VLMOutput]:
         """Returns the most recent VLM output — may be several frames old."""

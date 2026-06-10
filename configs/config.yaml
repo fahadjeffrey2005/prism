@@ -19,8 +19,8 @@ sensory_core:
     model: "yolov8n.pt"                     # nano — fast, Jetson friendly
     confidence_threshold: 0.35
     iou_threshold: 0.45
-    device: "mps"                           # Metal on M4 | "cuda" on Jetson | "cpu" fallback
-    img_size: 416
+    device: "cuda"                          # cuda on Jetson | "mps" on M4 | "cpu" fallback
+    img_size: 640
     classes_of_interest:                    # COCO classes relevant to driving
       - 0   # person
       - 1   # bicycle
@@ -33,7 +33,7 @@ sensory_core:
 
   depth:
     model: "depth-anything-v2-small"        # small — edge deployable
-    device: "mps"
+    device: "cuda"
     run_every_n_frames: 3                   # run at ~10fps when camera is 30fps
     encoder: "vits"                         # vits | vitb | vitl
 
@@ -86,16 +86,16 @@ vlm:
   model_dir: "~/prism_data/models/qwen2_5_vl_7b"  # local path — preferred on Jetson
   device: "cuda"                            # cuda on Jetson | cpu fallback on Mac
   max_new_tokens: 400
-  divergence_threshold: 0.15               # trigger VLM when pred diverges this much (lowered for real-world data)
-  max_silence_s: 15.0                      # force VLM call after this many seconds
-  cooldown_s: 8.0                          # min gap between VLM calls
+  divergence_threshold: 0.40               # T1 threshold — matches paper (θ_δ = 0.40)
+  max_silence_s: 8.0                       # T5 keepalive — force VLM after 8s silence (T_max)
+  cooldown_s: 0.4                          # min gap between VLM calls (T_cool) — max 2.5Hz invocation rate
 
 # ── LSTM Intent Predictor ─────────────────────────────────────────────────────
 lstm_intent_checkpoint: "~/prism_data/checkpoints/lstm_intent/model.pt"
 
 # ── Adaptive Planner ─────────────────────────────────────────────────────────
 planner:
-  cruise_speed_mps:     8.33   # 30 km/h — nuScenes urban default
+  cruise_speed_mps:     4.17   # 15 km/h — campus/Indian urban roads
   max_accel_mps2:       2.0    # comfortable urban acceleration
   max_decel_mps2:       4.0    # firm braking (0.4 g)
   emergency_decel_mps2: 8.0   # panic brake (0.8 g)
