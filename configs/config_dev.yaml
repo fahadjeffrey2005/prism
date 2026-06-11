@@ -3,77 +3,85 @@
 # VLM disabled (no CUDA on Mac). Everything else runs on MPS.
 # For Jetson production: use config.yaml
 
-# ── Sensory Core ──────────────────────────────────────────────────────────────
 sensory_core:
-  device: mps
-  model: yolov8n.pt
-  confidence_threshold: 0.35
-  iou_threshold: 0.45
-  img_size: 640
+  detection:
+    model: "yolov8n.pt"
+    confidence_threshold: 0.35
+    iou_threshold: 0.45
+    device: "mps"
+    img_size: 640
+    classes_of_interest: [0, 1, 2, 3, 5, 7, 9, 11]
+  depth:
+    model: "depth-anything-v2-small"
+    device: "mps"
+    run_every_n_frames: 3
+    encoder: "vits"
+  optical_flow:
+    method: "farneback"
+    run_every_n_frames: 1
   sampling:
+    camera_fps: 12
     detection_fps: 12
     depth_fps: 4
+    segmentation_fps: 4
     flow_fps: 12
-  depth:
-    model: depth_anything_v2_small
-    device: mps
 
-# ── World Model ───────────────────────────────────────────────────────────────
 world_model:
-  max_actors: 20
-  tracker:
-    max_age: 5
+  bev:
+    x_range: [-50, 50]
+    y_range: [-50, 50]
+    z_range: [-3, 5]
+    resolution: 0.5
+    grid_size: [200, 200]
+  actor_tracker:
+    max_age: 10
     min_hits: 2
     iou_threshold: 0.3
-  bev:
-    grid_size_m: 40.0
-    resolution: 0.25
-  risk:
-    close_threshold_m: 5.0
-    medium_threshold_m: 15.0
 
-# ── Predictive Engine ─────────────────────────────────────────────────────────
-predictive_engine:
-  horizon_s: 6.0
-  intent_classes: 9
-  lstm:
-    enabled: true
-    hidden_size: 128
-    num_layers: 2
-    min_track_length: 8
-  divergence_threshold: 0.40
+cameras:
+  names: ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+          "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
+  primary: "CAM_FRONT"
 
-# ── VLM / Semantic Reasoner ───────────────────────────────────────────────────
 vlm:
-  enabled: false            # No CUDA on Mac — runs in mock mode
-  device: mps
-  model_id: Qwen/Qwen2.5-VL-7B-Instruct
-  model_dir: ~/prism_data/models/qwen2_5_vl_7b
+  enabled: false
+  device: "mps"
+  model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+  model_dir: "~/prism_data/models/qwen2_5_vl_7b"
   divergence_threshold: 0.40
   max_silence_s: 8.0
   cooldown_s: 0.4
 
-# ── Arbitration Core ──────────────────────────────────────────────────────────
-arbitration:
-  weights:
-    smart_decision: 0.35
-    predictive:     0.35
-    world_model:    0.15
-    vlm:            0.15
-  vlm_staleness:
-    tau_s: 2.0
-    w_min: 0.02
-  safety_buffer_threshold: 1.5
+lstm_intent_checkpoint: "~/prism_data/checkpoints/lstm_intent/model.pt"
 
-# ── Adaptive Planner ──────────────────────────────────────────────────────────
 planner:
-  cruise_speed_mps: 5.56
-  max_jerk: 2.0
-  comfortable_decel: 4.0
-  emergency_decel: 8.0
+  cruise_speed_mps: 4.17
+  max_accel_mps2: 2.0
+  max_decel_mps2: 4.0
+  emergency_decel_mps2: 8.0
+  max_jerk_mps3: 2.0
+  plan_horizon_s: 3.0
+  plan_dt_s: 0.1
+  safety_margin_m: 3.0
 
-# ── Logging / Output ──────────────────────────────────────────────────────────
+ros2_bag:
+  topics:
+    camera: "/usb_cam/image_raw"
+    camera_info: "/usb_cam/camera_info"
+    lidar: "/velodyne_points"
+    imu: "/imu/data"
+  sync_tolerance_s: 0.08
+  usb_cam_defaults:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480
+
 logging:
-  viz_output_dir: ~/prism_data/experiments/visualizations/bag_runs
-  trigger_log_dir: ~/prism_data/logs/triggers
-  level: INFO
+  level: "INFO"
+  use_wandb: false
+  wandb_project: "prism-autonomy"
+  save_visualizations: true
+  viz_output_dir: "~/prism_data/experiments/visualizations"

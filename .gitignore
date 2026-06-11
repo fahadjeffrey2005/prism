@@ -28,8 +28,11 @@ hf_cache/
 experiments/
 visualizations/
 
-# macOS
+# macOS resource forks and metadata — never commit these
 .DS_Store
+._*
+.___*
+__MACOSX/
 
 # Jupyter
 .ipynb_checkpoints/
