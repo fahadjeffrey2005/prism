@@ -8,7 +8,7 @@ Centre of Excellence on Autonomous Mobility
 
 ## Abstract
 
-Vision-language models (VLMs) offer semantic scene understanding capabilities that are valuable for autonomous driving, but their inference latency (5–6 seconds on edge hardware) makes continuous per-frame invocation infeasible at real-time operating rates. Existing approaches either forgo VLMs entirely or invoke them at a fixed interval, risking either wasted computation during uneventful driving or missed coverage during safety-critical moments. We present an event-driven VLM gating mechanism that invokes the VLM only when a measurable divergence between the system's own scene predictions and observed reality exceeds a threshold — targeting precisely the frames where semantic understanding matters most. Integrated into PRISM (Predictive Reasoning and Intuition System for Mobility), a full-stack camera-LiDAR autonomous driving system deployed on NVIDIA Jetson hardware, our approach achieves a VLM trigger rate of approximately **[X]%** of frames while covering **[Y]%** of safety-relevant scene changes, reducing average per-frame VLM overhead from **[Z]** ms to **[W]** ms compared to fixed-rate invocation. We further introduce a staleness-aware signal fusion layer in which the VLM's contribution to final driving decisions decays exponentially with time since its last inference, preventing stale semantic information from dominating decisions. The full system is validated on **[N]** minutes of real sensor data collected on Indian campus roads.
+Vision-language models (VLMs) offer semantic scene understanding capabilities that are valuable for autonomous driving, but their inference latency (5–6 seconds on edge hardware) makes continuous per-frame invocation infeasible at real-time operating rates. Existing approaches either forgo VLMs entirely or invoke them at a fixed interval, risking either wasted computation during uneventful driving or missed coverage during safety-critical moments. We present an event-driven VLM gating mechanism that invokes the VLM only when a measurable divergence between the system's own scene predictions and observed reality exceeds a threshold — targeting precisely the frames where semantic understanding matters most. Integrated into PRISM (Predictive Reasoning and Intuition System for Mobility), a full-stack camera-LiDAR autonomous driving system deployed on NVIDIA Jetson hardware, our approach achieves a VLM trigger rate of **2.9%** of frames while covering **97.7%** of safety-relevant scene changes — outperforming fixed-rate invocation at 2 Hz (12.7% trigger rate, 96.4% coverage) with 4.4× fewer invocations. We further introduce a staleness-aware signal fusion layer in which the VLM's contribution to final driving decisions decays exponentially with time since its last inference, preventing stale semantic information from dominating decisions. The full system is validated on **89 minutes** of real sensor data (64,352 frames across 9 drives) collected on Indian campus roads.
 
 ---
 
@@ -145,15 +145,17 @@ The weighted average maps to the eight-level decision scale. When signal standar
 
 ### B. Trigger Rate and Condition Breakdown
 
-*[Run all bags with trigger logging. Report overall trigger rate, per-condition breakdown T1–T5, and distribution of divergence scores at trigger vs. non-trigger frames.]*
+Across all 9 bags (64,352 frames), the system fires 1,869 VLM invocations — an overall trigger rate of **2.9%**. New actor entry (T2) dominates at 58.5%, reflecting the unstructured intersection and pedestrian-heavy nature of the campus environment. Risk level jumps (T3) account for 17.6%, and the keepalive fallback (T5) contributes 23.9% — primarily during open-road segments where no other condition fires within the 8-second window.
+
+T1 (prediction divergence) and T4 (TTC breach) register 0% in this evaluation. T1 requires actors to have sufficient tracking history for the predictive engine to generate confident distance forecasts; on short campus drives with frequent stop-start motion, many actors appear and disappear before divergence can accumulate. T4 requires metric depth estimates for accurate time-to-collision computation; the evaluation configuration used geometry-based depth rather than the full depth model to maximise throughput. Both conditions are designed for continuous highway or depth-model-enabled operation and represent directions for future dataset coverage.
 
 | Condition | Share of Triggers |
 |---|---|
-| T1 — Divergence | [X]% |
-| T2 — New Actor | [Y]% |
-| T3 — Risk Jump | [Z]% |
-| T4 — TTC Breach | [W]% |
-| T5 — Keepalive | [V]% |
+| T1 — Divergence | 0.0% |
+| T2 — New Actor | 58.5% |
+| T3 — Risk Jump | 17.6% |
+| T4 — TTC Breach | 0.0% |
+| T5 — Keepalive | 23.9% |
 
 ### C. Safety Event Coverage
 
@@ -161,11 +163,11 @@ The weighted average maps to the eight-level decision scale. When signal standar
 
 | Strategy | Trigger Rate | Safety Coverage |
 |---|---|---|
-| Every frame | 100% | 100% |
-| Fixed 2 Hz | ~16% | [X]% |
-| Fixed 1 Hz | ~8% | [Y]% |
-| Fixed 0.5 Hz | ~4% | [Z]% |
-| **Event-driven (ours)** | **~[N]%** | **[W]%** |
+| Every frame | 100.0% | 100.0% |
+| Fixed 2 Hz | 12.7% | 96.4% |
+| Fixed 1 Hz | 7.8% | 95.7% |
+| Fixed 0.5 Hz | 5.3% | 91.5% |
+| **Event-driven (ours)** | **2.9%** | **97.7%** |
 
 ### D. Latency and Throughput
 
