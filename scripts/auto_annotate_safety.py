@@ -112,7 +112,17 @@ def load_trigger_log(csv_path: Path) -> list:
     rows = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
-            rows.append(row)
+            rows.append({
+                "timestamp":         float(row.get("timestamp", 0)),
+                "frame_idx":         int(row.get("frame_idx", 0)),
+                "risk_level":        int(float(row.get("risk_level", 0))),
+                "risk_score":        float(row.get("risk_score", 0)),
+                "actor_count":       int(float(row.get("actor_count", 0))),
+                "divergence_score":  float(row.get("divergence_score", 0)),
+                "triggered":         int(row.get("triggered", 0)),
+                "trigger_condition": row.get("trigger_condition", ""),
+                "vlm_caution":       row.get("vlm_caution", ""),
+            })
     return rows
 
 
