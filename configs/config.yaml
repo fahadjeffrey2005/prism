@@ -16,7 +16,7 @@ data:
 # ── Sensory Core ──────────────────────────────────────────────────────────────
 sensory_core:
   detection:
-    model: "yolov8n.pt"                     # nano — fast, Jetson friendly
+    model: "yolov8n.engine"                     # nano — fast, Jetson friendly
     confidence_threshold: 0.35
     iou_threshold: 0.45
     device: "cuda"                          # cuda on Jetson | "mps" on M4 | "cpu" fallback
