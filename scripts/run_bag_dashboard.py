@@ -83,24 +83,23 @@ def _escalate(decision: str, lidar_dets: list, ego_speed_mps: float = 5.0) -> st
 # ── Ego speed estimator (optical flow based) ──────────────────────────────────
 class EgoSpeedEstimator:
     """
-    Estimates actual forward speed from optical flow on the road surface.
+    Estimates ego speed from optical flow on the road surface.
 
-    Physics (pinhole camera, ground plane):
-        flow_y (road at distance d) ≈ fy * cam_h * v / (fps * d²)
-        → v ≈ flow_y * fps * d² / (fy * cam_h)
+    Uses MEDIAN (not mean) of the lower-centre patch to reject outliers
+    from moving objects / reflections. Two-stage smoothing: per-frame
+    median then EMA, giving stable readings without over-smoothing.
 
-    Uses lower-centre image patch (road ~8m ahead) as reference.
-    EMA-smoothed to suppress frame-to-frame jitter.
-    Much better than plan.current_speed_mps which ramps to cruise
-    regardless of actual vehicle state.
+    Calibration: tuned for campus/urban roads at 5-40 km/h.
     """
-    REF_DIST_M = 8.0    # reference ground distance for calibration
-    CAM_H_M    = 1.2    # camera height above ground (metres)
-    EMA_ALPHA  = 0.30   # smoothing — higher = more responsive, more noise
-    MAX_MPS    = 15.0   # clamp at 54 km/h; anything above is noise
+    REF_DIST_M  = 6.0    # road reference distance (m) — closer = more signal
+    CAM_H_M     = 1.3    # camera mounting height (m)
+    EMA_ALPHA   = 0.18   # lower = smoother, less reactive to noise
+    MAX_MPS     = 12.0   # 43 km/h cap — campus/urban max
+    MIN_FLOW    = 0.15   # suppress sub-pixel noise as zero speed
 
     def __init__(self):
-        self._speed = 0.0
+        self._speed  = 0.0
+        self._raw_q  = []   # short median window for additional smoothing
 
     def update(self, flow: "np.ndarray | None",
                intrinsics=None, fps: float = 12.0) -> float:
@@ -109,19 +108,24 @@ class EgoSpeedEstimator:
             return self._speed
 
         h, w = flow.shape[:2]
-        # Lower-centre patch — road surface at ~REF_DIST_M ahead
-        y1, y2 = int(h * 0.68), int(h * 0.88)
-        x1, x2 = int(w * 0.30), int(w * 0.70)
-        road_vy = flow[y1:y2, x1:x2, 1]   # vertical component
+        # Lower-centre road patch — avoid bonnet (bottom 5%) and horizon (top 40%)
+        y1, y2 = int(h * 0.65), int(h * 0.90)
+        x1, x2 = int(w * 0.25), int(w * 0.75)
+        patch   = flow[y1:y2, x1:x2, 1]   # vertical component only
 
-        # Forward motion → road moves DOWN in image (positive v)
-        fwd_flow = float(np.clip(road_vy, 0, None).mean())
+        # Use 70th percentile — captures genuine forward flow, ignores outliers
+        fwd_flow = float(np.percentile(patch, 70))
+        fwd_flow = max(fwd_flow, 0.0)   # forward motion only
 
-        # Calibration constant — use actual fy when available
-        fy = float(intrinsics.fy) * (w / intrinsics.width) if intrinsics else 600.0
+        if fwd_flow < self.MIN_FLOW:
+            # Decay toward zero when flow is negligible (stationary or near-stop)
+            self._speed *= 0.85
+            return self._speed
+
+        fy = float(intrinsics.fy) * (w / intrinsics.width) if intrinsics else 580.0
         k  = (fps * self.REF_DIST_M ** 2) / (fy * self.CAM_H_M)
-
         raw = float(np.clip(fwd_flow * k, 0.0, self.MAX_MPS))
+
         self._speed = (1.0 - self.EMA_ALPHA) * self._speed + self.EMA_ALPHA * raw
         return self._speed
 

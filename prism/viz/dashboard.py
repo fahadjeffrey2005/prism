@@ -70,7 +70,7 @@ DEC_SUBTITLES = {
 
 _vlm_buf = ""
 _vlm_ttl = 0
-VLM_HOLD  = 72
+VLM_HOLD  = 200   # hold for ~10s at 20fps — matches VLM inference cycle
 SIDEBAR_FRAC = 0.30
 
 
@@ -327,13 +327,7 @@ def draw_spatial_panel(panel: np.ndarray,
     cv2.arrowedLine(panel, (ex, ey-12), (ex+hdiff, ey-26),
                     TEXT_WHITE, 1, tipLength=0.4)
 
-    # ── Legend ────────────────────────────────────────────────────────────
-    for i, (sym, col) in enumerate([
-        ("P", COL_PERSON), ("V", COL_VEHICLE),
-        ("L", COL_STATIONARY), ("B", COL_BIKE),
-    ]):
-        cv2.putText(panel, sym, (4 + i*30, h-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, col, 1)
+    # Legend removed — colour coding is self-evident
 
     cv2.rectangle(panel, (0, 0), (w-1, h-1), (45, 65, 45), 1)
 
@@ -645,7 +639,8 @@ def render_dashboard(image: np.ndarray,
     # ── Top-left HUD ──────────────────────────────────────────────────────────
     _blend(cam,0,0,310,48,(0,0,0),0.52)
     _put(cam,"PRISM  AUTONOMOUS  PERCEPTION",8,17,0.44,TEXT_CYAN)
-    _put(cam,f"FPS: {fps:.1f}  |  Speed: {speed_kmh:.0f} km/h",8,36,0.36,ACCENT_GREEN)
+    spd_str = f"~{speed_kmh:.0f}" if speed_kmh > 1.0 else "0"
+    _put(cam,f"FPS: {fps:.1f}  |  {spd_str} km/h",8,36,0.36,ACCENT_GREEN)
 
     # ── Top-centre: real YOLO counts ─────────────────────────────────────────
     n_persons  = sum(1 for d in yolo_dets if d.bbox.class_name in PERSON_CLS)
@@ -789,41 +784,50 @@ def render_dashboard(image: np.ndarray,
     reasoning_lines = []
 
     if vlm_out is not None and vlm_out.success:
-        age = time.time() - vlm_out.timestamp
-        age_col = TEXT_WHITE if age < 3.0 else TEXT_DIM
+        age     = time.time() - vlm_out.timestamp
+        # Fresh < 8s (one keepalive cycle), stale after
+        age_col = (TEXT_WHITE if age < 4.0 else
+                   ACCENT_YELLOW if age < 8.0 else TEXT_DIM)
 
-        # Scene summary — strip non-ASCII
-        raw_sum = vlm_out.scene_summary or vlm_out.scene_context or ""
-        summary = ''.join(c if ord(c) < 128 else '-' for c in raw_sum)
-        if len(summary) > 38: summary = summary[:36] + ".."
-        prefix = "VLM:" if vlm_is_real else "SIM:"
-        if summary:
-            reasoning_lines.append((f"{prefix} {summary}", age_col))
+        # Scene context — richer than summary
+        raw_ctx = vlm_out.scene_context or vlm_out.scene_summary or ""
+        ctx = ''.join(c if ord(c) < 128 else '-' for c in raw_ctx)
+        if len(ctx) > 40: ctx = ctx[:38] + ".."
+        prefix = "VLM" if vlm_is_real else "SIM"
+        if ctx:
+            reasoning_lines.append((f"{prefix}: {ctx}", age_col))
+
+        # Scene summary (second line if different)
+        raw_sum = vlm_out.scene_summary or ""
+        summ = ''.join(c if ord(c) < 128 else '-' for c in raw_sum)
+        if summ and summ != raw_ctx:
+            if len(summ) > 40: summ = summ[:38] + ".."
+            reasoning_lines.append((summ, age_col))
 
         # Risk flags
         for flag in vlm_out.risk_flags[:2]:
             flag_str = ''.join(c if ord(c) < 128 else '-' for c in flag)
-            flag_str = flag_str[:36] if len(flag_str) > 36 else flag_str
-            reasoning_lines.append((f"  - {flag_str}", ACCENT_YELLOW))
+            flag_str = flag_str[:38] if len(flag_str) > 38 else flag_str
+            reasoning_lines.append((f"! {flag_str}", ACCENT_YELLOW))
 
-        # Caution level with age
-        caution = vlm_out.recommended_caution.upper()
+        # Caution level + freshness
+        caution  = vlm_out.recommended_caution.upper()
+        fresh_bar = "*" * max(1, min(5, int(5 * max(0, 1 - age/8.0))))
         reasoning_lines.append((
-            f"Caution: {caution}  [{age:.0f}s ago]",
+            f"Caution:{caution}  {fresh_bar}  {age:.0f}s",
             WARN_RED if caution in ("HIGH","CRITICAL") else age_col
         ))
     else:
-        # VLM not enabled / no output — show SmartDecision secondary reasons
+        # VLM not yet returned — show SmartDecision live data
         if scene is not None and scene.secondary_reasons:
-            for r in scene.secondary_reasons[:3]:
-                r_str = r[:38] if len(r) > 38 else r
+            for r in scene.secondary_reasons[:2]:
+                r_str = r[:40] if len(r) > 40 else r
                 reasoning_lines.append((r_str, TEXT_WHITE))
-        elif scene is not None:
+        if scene is not None:
             reasoning_lines.append(("Scene nominal — no alerts", ACCENT_GREEN))
         else:
             reasoning_lines.append(("Waiting for scene data...", TEXT_DIM))
-
-        reasoning_lines.append(("[VLM off — enable in config]", TEXT_DIM))
+        reasoning_lines.append(("VLM computing...", TEXT_DIM))
 
     for i, (txt, col) in enumerate(reasoning_lines[:4]):
         if txt:
